@@ -223,6 +223,7 @@ class VFSBrowser:
             headless="new" if use_headless else False,
             lang="en-US",
             browser_args=args,
+            no_sandbox=True,
         )
         logger.info("[W%d] Chrome запущен (%s)", self.worker_id, self.email)
 
