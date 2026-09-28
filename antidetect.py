@@ -69,32 +69,22 @@ async def setup_stealth_on_new_page(page, profile_path: str = "") -> None:
 
 
 def get_chrome_args(profile_path: str = "") -> list[str]:
-    """Chrome args from persistent profile."""
+    """Chrome args from persistent profile.
+    Minimal set — every extra flag is a detection vector for Cloudflare."""
     profile = get_profile(profile_path)
     width, height = profile["viewport"]
     return [
         f"--window-size={width},{height}",
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-infobars",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-popup-blocking",
         "--lang=en-US",
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--enforce-webrtc-ip-permission-check",
-        # Low-memory VPS optimizations (1 CPU / 1 GB RAM)
-        "--disable-gpu",
         "--disable-dev-shm-usage",
         "--no-sandbox",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-default-apps",
         "--disable-sync",
         "--disable-translate",
-        "--metrics-recording-only",
         "--mute-audio",
-        "--renderer-process-limit=2",
-        "--disable-background-timer-throttling",
-        "--js-flags=--max-old-space-size=256",
     ]
