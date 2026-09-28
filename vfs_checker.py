@@ -341,7 +341,59 @@ class VFSBrowser:
             })()
         """)
 
+    async def _try_turnstile_click(self) -> bool:
+        """Try clicking the real Turnstile checkbox before falling back to API.
+        Real users click the widget — only bots go straight to API solving."""
+        try:
+            has_iframe = await self.page.evaluate("""
+                (() => {
+                    const iframe = document.querySelector(
+                        'iframe[src*="challenges.cloudflare.com"]'
+                    );
+                    if (!iframe) return null;
+                    const r = iframe.getBoundingClientRect();
+                    if (r.width < 10 || r.height < 10) return null;
+                    return {x: r.x, y: r.y, w: r.width, h: r.height};
+                })()
+            """)
+            if not has_iframe or not isinstance(has_iframe, dict):
+                return False
+
+            if self.hc:
+                tx = has_iframe["x"] + has_iframe["w"] * 0.15
+                ty = has_iframe["y"] + has_iframe["h"] * 0.5
+                await self.hc._move_to(tx, ty)
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                await self.hc._mouse_down(tx, ty)
+                await asyncio.sleep(random.uniform(0.05, 0.12))
+                await self.hc._mouse_up(tx, ty)
+            else:
+                return False
+
+            for _ in range(8):
+                await asyncio.sleep(2)
+                state = await self._page_state()
+                if state not in ("captcha", "cloudflare"):
+                    logger.info("Turnstile solved by real click")
+                    return True
+                token_filled = await self.page.evaluate("""
+                    (() => {
+                        const el = document.querySelector('[name="cf-turnstile-response"]');
+                        return el && el.value && el.value.length > 20;
+                    })()
+                """)
+                if token_filled:
+                    logger.info("Turnstile token filled after click")
+                    return True
+            return False
+        except Exception as e:
+            logger.debug("Turnstile click attempt failed: %s", e)
+            return False
+
     async def _solve_turnstile(self) -> bool:
+        if await self._try_turnstile_click():
+            return True
+
         sitekey = await self._extract_sitekey()
         if not sitekey:
             logger.error("sitekey не найден")
@@ -349,7 +401,7 @@ class VFSBrowser:
             return False
 
         page_url = await self.page.evaluate("window.location.href")
-        logger.info("2Captcha: решаю Turnstile (sitekey=%s...)", sitekey[:16])
+        logger.info("2Captcha fallback: solving Turnstile (sitekey=%s...)", sitekey[:16])
         token = await asyncio.to_thread(self.captcha_solver.solve_turnstile, sitekey, page_url)
         if not token:
             return False
