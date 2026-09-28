@@ -37,6 +37,7 @@ from dom_dumper import dump_page
 from human_clicker import HumanClicker
 from network_interceptor import NetworkInterceptor
 from local_proxy import start_local_proxy, get_local_proxy_url, DEFAULT_PORT
+from notifier import send_telegram_photo
 from session_warmer import SessionWarmer
 
 logger = logging.getLogger(__name__)
@@ -344,11 +345,13 @@ class VFSBrowser:
         except Exception:
             return ""
 
-    async def _screenshot(self, tag: str) -> str:
+    async def _screenshot(self, tag: str, send_tg: bool = True) -> str:
         path = os.path.join(Config.SCREENSHOT_DIR, f"{tag}_{int(time.time())}.png")
         try:
             await self.page.save_screenshot(path)
             logger.info("Screenshot: %s", path)
+            if send_tg and os.path.exists(path):
+                send_telegram_photo(path, f"[W{self.worker_id}] {tag}")
         except Exception as e:
             logger.debug("Screenshot failed (%s): %s", tag, e)
         self._cleanup_screenshots()
