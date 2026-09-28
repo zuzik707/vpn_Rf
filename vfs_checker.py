@@ -21,6 +21,7 @@ VFS Global Slot Checker — точно под visa.vfsglobal.com/uzb/en/lva
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -90,13 +91,16 @@ class VFSBrowser:
             proxy_for_chrome, self._proxy_auth = self._parse_proxy_url(Config.PROXY_URL)
             args.append(f"--proxy-server={proxy_for_chrome}")
             logger.info("Proxy: %s", proxy_for_chrome.split("@")[-1] if "@" in proxy_for_chrome else proxy_for_chrome)
+        has_display = bool(os.environ.get("DISPLAY"))
+        if not has_display:
+            logger.warning("No DISPLAY — using headless='new'. For best results: apt install xvfb && xvfb-run python main.py")
         self.browser = await uc.start(
             user_data_dir=Config.BROWSER_DATA_DIR,
-            headless=False,
+            headless="new" if not has_display else False,
             lang="en-US",
             browser_args=args,
         )
-        logger.info("Chrome запущен (nodriver)")
+        logger.info("Chrome запущен (nodriver, headless=%s)", "new" if not has_display else "False")
 
     @staticmethod
     def _parse_proxy_url(url: str) -> tuple[str, tuple[str, str] | None]:
@@ -215,81 +219,57 @@ class VFSBrowser:
             return ""
 
     async def _page_state(self) -> str:
-        """
-        Определяем где мы на сайте VFS.
-        Приоритет: URL → DOM-элементы → текст.
-        Так надёжнее чем только текст — если VFS поменяет фразу, URL и DOM останутся.
-        """
-        url = (await self._url()).lower()
-        html = await self._html()
-        text = await self._text()
-        both = html + " " + text
-
-        # Blocked — проверяем первым
-        if any(m in both for m in BLOCKED_MARKERS):
-            return "blocked"
-
-        # Cloudflare challenge — по URL и DOM
-        if "challenges.cloudflare.com" in url or "/cdn-cgi/" in url:
-            return "cloudflare"
-        if any(m in both for m in CLOUDFLARE_MARKERS):
-            return "cloudflare"
-
-        # Captcha — по iframe/виджету
-        has_captcha = await self.page.evaluate("""
-            (() => {
-                return !!(
-                    document.querySelector('.cf-turnstile') ||
-                    document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
-                    document.querySelector('[data-sitekey]') ||
-                    document.querySelector('.h-captcha') ||
-                    document.querySelector('.g-recaptcha')
-                );
-            })()
-        """)
-        if has_captcha:
-            return "captcha"
-
-        # Login — по URL + наличие password input
-        if "/login" in url:
-            has_pwd = await self.page.evaluate(
-                "!!document.querySelector('input[type=\"password\"]')"
-            )
-            if has_pwd:
-                return "login"
-
-        # Dashboard — по URL + кнопка Start New Booking
-        if "/dashboard" in url or "start new booking" in both:
-            has_btn = await self.page.evaluate("""
+        """Single CDP round-trip to determine current page state."""
+        blocked_json = json.dumps(BLOCKED_MARKERS)
+        cf_json = json.dumps(CLOUDFLARE_MARKERS)
+        try:
+            result = await self.page.evaluate("""
                 (() => {
-                    const els = document.querySelectorAll('button, a');
-                    return [...els].some(e =>
-                        e.textContent.toLowerCase().includes('start new booking')
+                    const url = window.location.href.toLowerCase();
+                    const html = (document.documentElement.outerHTML || '').toLowerCase();
+                    const text = (document.body.innerText || '').toLowerCase();
+                    const both = html + ' ' + text;
+                    const blocked = """ + blocked_json + """;
+                    const cfMarkers = """ + cf_json + """;
+                    if (blocked.some(m => both.includes(m))) return 'blocked';
+                    if (url.includes('challenges.cloudflare.com') || url.includes('/cdn-cgi/'))
+                        return 'cloudflare';
+                    if (cfMarkers.some(m => both.includes(m))) return 'cloudflare';
+                    const hasCaptcha = !!(
+                        document.querySelector('.cf-turnstile') ||
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+                        document.querySelector('[data-sitekey]') ||
+                        document.querySelector('.h-captcha') ||
+                        document.querySelector('.g-recaptcha')
                     );
+                    if (hasCaptcha) return 'captcha';
+                    if (url.includes('/login') &&
+                        document.querySelector('input[type="password"]'))
+                        return 'login';
+                    const hasSNB = [...document.querySelectorAll('button, a')]
+                        .some(e => e.textContent.toLowerCase().includes('start new booking'));
+                    if (url.includes('/dashboard') || hasSNB) {
+                        if (hasSNB) return 'dashboard';
+                    }
+                    if (url.includes('/appointment') || url.includes('/book')) {
+                        const n = document.querySelectorAll(
+                            'select, mat-select, [role="combobox"]'
+                        ).length;
+                        if (n >= 2) return 'appointment_form';
+                    }
+                    if (both.includes('appointment details') && both.includes('choose your'))
+                        return 'appointment_form';
+                    if (both.includes('start new booking')) return 'dashboard';
+                    if ((both.includes('sign in') || both.includes('log in')) &&
+                        both.includes('password')) return 'login';
+                    if (both.includes('sign out') || both.includes('my account'))
+                        return 'logged_in';
+                    return 'unknown';
                 })()
             """)
-            if has_btn:
-                return "dashboard"
-
-        # Appointment form — по URL + наличие select/dropdown'ов
-        if "/appointment" in url or "/book" in url:
-            has_selects = await self.page.evaluate(
-                "document.querySelectorAll('select, mat-select, [role=\"combobox\"]').length >= 2"
-            )
-            if has_selects:
-                return "appointment_form"
-
-        # Fallback текстовые маркеры
-        if "appointment details" in both and "choose your" in both:
-            return "appointment_form"
-        if "start new booking" in both:
-            return "dashboard"
-        if ("sign in" in both or "log in" in both) and "password" in both:
-            return "login"
-        if "sign out" in both or "my account" in both:
-            return "logged_in"
-
-        return "unknown"
+            return result or "unknown"
+        except Exception:
+            return "unknown"
 
     # ── Cloudflare / CAPTCHA ───────────────────────────────────────
 
@@ -483,6 +463,22 @@ class VFSBrowser:
             self.cf_fail_count = 0
             await self._delay(2, 4)
         return True
+
+    async def _ensure_proxy_auth(self) -> None:
+        """Re-enable proxy auth if connection dropped during long sessions."""
+        if not self._proxy_auth or not self.page:
+            return
+        try:
+            ip_check = await self.page.evaluate(
+                "fetch('https://httpbin.org/ip',{signal:AbortSignal.timeout(8000)})"
+                ".then(r=>r.json()).then(d=>d.origin).catch(()=>null)"
+            )
+            if ip_check:
+                return
+            logger.warning("Proxy health check failed — re-enabling auth")
+            await self._setup_proxy_auth(self.page, *self._proxy_auth)
+        except Exception as e:
+            logger.debug("Proxy health check error: %s", e)
 
     @property
     def should_backoff(self) -> bool:
@@ -864,6 +860,8 @@ class VFSBrowser:
         if not self.browser or not self.logged_in:
             if not await self.login():
                 return False, "Логин не удался", None
+
+        await self._ensure_proxy_auth()
 
         results = []
         for subcategory in Config.VFS_SUBCATEGORIES:

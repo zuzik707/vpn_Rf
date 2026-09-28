@@ -49,4 +49,18 @@ def get_chrome_args() -> list[str]:
         "--lang=en-US",
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--enforce-webrtc-ip-permission-check",
+        # Low-memory VPS optimizations (1 CPU / 1 GB RAM)
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-translate",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-zygote",
+        "--single-process",
+        "--js-flags=--max-old-space-size=256",
     ]
