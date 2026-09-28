@@ -221,10 +221,14 @@ class ProxyManager:
     def stats_text(self) -> str:
         if not self.port_id:
             return "Proxy: не настроен"
-        traffic = self.get_traffic_left()
-        balance = self.get_balance()
         country = self._port_info.get("country", "?")
-        return (
-            f"Proxy: {country} | Трафик: {traffic:.0f} MB | "
-            f"Баланс: ${balance:.2f}"
-        )
+        try:
+            traffic = self.get_traffic_left()
+            balance = self.get_balance()
+            return (
+                f"Proxy: {country} | Трафик: {traffic:.0f} MB | "
+                f"Баланс: ${balance:.2f}"
+            )
+        except Exception as e:
+            logger.debug("stats_text API error: %s", e)
+            return f"Proxy: {country} | stats unavailable"

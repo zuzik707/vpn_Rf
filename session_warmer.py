@@ -84,9 +84,9 @@ class SessionWarmer:
 
         elif actions == "hover_link":
             try:
-                links = await self.page.query_selector_all("a[href]")
+                links = await self.page.select_all("a[href]")
                 if links:
-                    link = random.choice(links[:10])
+                    random.choice(links[:10])
                     if self.hc:
                         await self.hc._move_to(
                             random.uniform(200, 800),

@@ -146,13 +146,10 @@ async def setup_stealth_on_new_page(page) -> None:
     Настраиваем stealth для новой страницы.
     Вызывается ПЕРЕД навигацией.
     """
-    # Инжектим скрипты через CDP чтобы они выполнились ДО загрузки страницы
     try:
+        import nodriver.cdp.page as cdp_page
         combined_script = "\n".join(STEALTH_SCRIPTS)
-        await page.send(
-            _cdp("Page.addScriptToEvaluateOnNewDocument"),
-            source=combined_script,
-        )
+        await page.send(cdp_page.add_script_to_evaluate_on_new_document(source=combined_script))
         logger.info("Stealth скрипты добавлены для всех будущих страниц")
     except Exception as e:
         logger.warning("CDP addScriptToEvaluateOnNewDocument failed: %s — fallback to post-inject", e)
@@ -185,11 +182,3 @@ def get_chrome_args() -> list[str]:
     ]
 
 
-def _cdp(method: str):
-    """Формируем CDP команду для nodriver."""
-    class CDPCmd:
-        def __init__(self, m):
-            self.method = m
-        def __str__(self):
-            return self.method
-    return CDPCmd(method)

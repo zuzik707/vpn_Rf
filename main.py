@@ -235,7 +235,11 @@ async def run_monitor():
 
             stats.checks_total += 1
             checks_since_login += 1
+            was_hot = hot_mode_until > 0
             hot_now = time.time() < hot_mode_until
+            if was_hot and not hot_now:
+                notify_status("Hot mode закончился — слоты разобрали")
+                hot_mode_until = 0.0
             logger.info("--- Проверка #%d | %s | %s ---",
                         stats.checks_total,
                         "HOT" if hot_now else ("день" if is_daytime() else "ночь"),
@@ -270,8 +274,6 @@ async def run_monitor():
                     consecutive_errors = 0
                 else:
                     stats.checks_success += 1
-                    if hot_now and time.time() >= hot_mode_until:
-                        notify_status("Hot mode закончился — слоты разобрали")
                     consecutive_errors = 0
 
             except Exception as e:

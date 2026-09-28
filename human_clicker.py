@@ -51,11 +51,13 @@ class HumanClicker:
 
     async def scroll_into_view(self, element) -> None:
         """Микро-скролл к элементу, как человек."""
-        await self.page.evaluate("""
-            (el) => {
-                el.scrollIntoView({behavior: 'smooth', block: 'center'});
-            }
-        """, element)
+        try:
+            await element.scroll_into_view()
+        except Exception:
+            try:
+                await element.apply("(el) => el.scrollIntoView({behavior: 'smooth', block: 'center'})")
+            except Exception:
+                pass
         await asyncio.sleep(random.uniform(0.3, 0.7))
 
     async def idle_drift(self, duration: float = 1.0) -> None:
@@ -130,14 +132,17 @@ class HumanClicker:
 
     async def _get_box(self, element) -> dict | None:
         try:
-            box = await self.page.evaluate("""
-                (el) => {
-                    const r = el.getBoundingClientRect();
+            result = await element.apply("""
+                function() {
+                    const r = this.getBoundingClientRect();
                     if (r.width === 0 || r.height === 0) return null;
-                    return {x: r.x, y: r.y, w: r.width, h: r.height};
+                    return JSON.stringify({x: r.x, y: r.y, w: r.width, h: r.height});
                 }
-            """, element)
-            return box
+            """)
+            if result and isinstance(result, str):
+                import json
+                return json.loads(result)
+            return result
         except Exception:
             return None
 

@@ -48,6 +48,7 @@ class BudgetGuard:
         self.total_spent += c
         self.consecutive_failures = 0
         self.consecutive_successes += 1
+        self._trim_old_solves(now)
 
     def record_failure(self) -> None:
         self.consecutive_failures += 1
@@ -84,6 +85,11 @@ class BudgetGuard:
 
     def _spent_since(self, since: float) -> float:
         return sum(c for t, c in self._solves if t >= since)
+
+    def _trim_old_solves(self, now: float) -> None:
+        cutoff = now - 86400
+        if self._solves and self._solves[0][0] < cutoff:
+            self._solves = [(t, c) for t, c in self._solves if t >= cutoff]
 
     def _pause(self, seconds: int, reason: str) -> None:
         self.paused_until = time.time() + seconds

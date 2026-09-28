@@ -285,7 +285,7 @@ class VFSBrowser:
 
         page_url = await self.page.evaluate("window.location.href")
         logger.info("2Captcha: решаю Turnstile (sitekey=%s...)", sitekey[:16])
-        token = self.captcha_solver.solve_turnstile(sitekey, page_url)
+        token = await asyncio.to_thread(self.captcha_solver.solve_turnstile, sitekey, page_url)
         if not token:
             return False
 
@@ -630,9 +630,10 @@ class VFSBrowser:
                         })()
                     """)
                     if email_el:
-                        email_el = await self.page.query_selector(
-                            "input#email, input[formcontrolname='username']"
-                        )
+                        email_el = await self._find_visible_input([
+                            "input#email:not(.d-none)",
+                            "input[formcontrolname='username']:not(.d-none)",
+                        ])
                 if not email_el:
                     await self._screenshot("no_email")
                     return False
@@ -704,18 +705,24 @@ class VFSBrowser:
                 if state in ("cloudflare", "captcha"):
                     continue
 
-            if state in ("dashboard", "logged_in", "appointment_form", "unknown"):
+            if state in ("dashboard", "logged_in", "appointment_form"):
                 break
 
+        # Проверяем что реально залогинились
+        final_state = await self._page_state()
+        if final_state in ("login", "cloudflare", "captcha", "blocked"):
+            logger.error("Логин не удался (final_state=%s)", final_state)
+            await self._screenshot("login_failed")
+            return False
+
         self.logged_in = True
-        self.on_dashboard = (await self._page_state()) == "dashboard"
+        self.on_dashboard = final_state == "dashboard"
         self.last_login_time = time.time()
-        # Подключаем перехват API после успешного логина
         try:
             await self.interceptor.attach(self.page)
         except Exception as e:
             logger.warning("Interceptor attach failed: %s", e)
-        logger.info("Login OK (state=%s)", await self._page_state())
+        logger.info("Login OK (state=%s)", final_state)
         return True
 
     # ── Core: check slots ──────────────────────────────────────────
@@ -917,17 +924,22 @@ class VFSBrowser:
         await dump_page(self.page, "unclear")
         return False, f"Неясный результат: {text[:200]}", screenshot
 
-    async def _ensure_dashboard(self) -> bool:
+    VFS_BASE = "https://visa.vfsglobal.com/uzb/en/lva"
+
+    async def _ensure_dashboard(self, depth: int = 0) -> bool:
         """Убеждаемся что мы на dashboard с кнопкой Start New Booking."""
+        if depth >= 3:
+            logger.error("_ensure_dashboard: max depth reached")
+            await self._screenshot("dashboard_loop")
+            return False
+
         state = await self._page_state()
 
         if state == "dashboard":
             return True
 
         if state in ("appointment_form",):
-            # Уже на форме — идём назад на dashboard
-            base = Config.VFS_URL.replace("/login", "")
-            await self.page.get(f"{base}/dashboard")
+            await self.page.get(f"{self.VFS_BASE}/dashboard")
             await self._delay(2, 4)
             if not await self._handle_obstacle():
                 return False
@@ -937,16 +949,15 @@ class VFSBrowser:
             self.logged_in = False
             if not await self.login():
                 return False
-            return await self._ensure_dashboard()
+            return await self._ensure_dashboard(depth + 1)
 
         if state in ("cloudflare", "captcha"):
             if not await self._handle_obstacle():
                 return False
-            return await self._ensure_dashboard()
+            return await self._ensure_dashboard(depth + 1)
 
         # logged_in или unknown — пробуем перейти на dashboard
-        base = Config.VFS_URL.replace("/login", "")
-        await self.page.get(f"{base}/dashboard")
+        await self.page.get(f"{self.VFS_BASE}/dashboard")
         await self._delay(2, 4)
         if not await self._handle_obstacle():
             return False
@@ -954,7 +965,6 @@ class VFSBrowser:
         if state == "dashboard":
             return True
 
-        # Последняя попытка
         logger.warning("Не могу попасть на dashboard (state=%s)", state)
         await self._screenshot("no_dashboard")
         return False

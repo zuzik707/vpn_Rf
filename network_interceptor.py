@@ -62,7 +62,7 @@ class NetworkInterceptor:
         self._attached = False
         self._page = None
 
-    async def _on_response(self, event: net.ResponseReceived) -> None:
+    def _on_response(self, event: net.ResponseReceived) -> None:
         try:
             url = event.response.url.lower()
             if not any(p in url for p in self.INTERESTING_PATTERNS):
