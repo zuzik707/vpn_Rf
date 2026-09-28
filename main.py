@@ -26,10 +26,12 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
+from accounts_db import get_enabled_accounts, import_from_env, count_accounts
 from budget_guard import BudgetGuard
 from config import Config
 from notifier import notify_error, notify_slots_found, notify_status
 from session_manager import SessionStats, save_session_state, load_session_state
+from tg_bot import TelegramBot
 from vfs_checker import VFSBrowser
 
 
@@ -130,7 +132,7 @@ def validate_config() -> list[str]:
         for var in ("VFS_EMAIL", "VFS_PASSWORD"):
             if not getattr(Config, var, ""):
                 missing.append(var)
-    for var in ("CAPTCHA_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+    for var in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
         if not getattr(Config, var, ""):
             missing.append(var)
     return missing
@@ -344,25 +346,68 @@ async def run_monitor():
         logger.info("Восстановлена статистика: %d проверок, %d слотов",
                      stats.checks_total, stats.slots_found_count)
 
-    accounts = Config.VFS_ACCOUNTS
+    # Импортируем аккаунты из .env в SQLite (если ещё нет)
+    if Config.VFS_ACCOUNTS:
+        imported = import_from_env(Config.VFS_ACCOUNTS)
+        if imported:
+            logger.info("Импортировано %d аккаунтов из .env в БД", imported)
+
+    # Загружаем аккаунты из БД
+    accounts = get_enabled_accounts()
+    if not accounts:
+        logger.error("Нет аккаунтов! Добавь через Telegram бот: /add email:password")
+        # Если в .env есть хотя бы один — используем его как fallback
+        if Config.VFS_ACCOUNTS:
+            accounts = Config.VFS_ACCOUNTS
+        else:
+            print("Нет аккаунтов. Добавь в .env (VFS_EMAIL/VFS_PASSWORD) или через TG бот (/add)")
+            sys.exit(1)
+    else:
+        # Дополняем proxy из Config если не указан в БД
+        for acct in accounts:
+            if not acct.get("proxy"):
+                acct["proxy"] = Config.PROXY_URL
+
     n = len(accounts)
     mode = "parallel" if n > 1 else "single"
+
+    hot_mode_shared = {"until": 0.0, "active": False}
+    worker_tasks: dict[str, asyncio.Task] = {}
+
+    # Telegram бот для управления аккаунтами
+    tg_bot = None
+    if Config.TELEGRAM_BOT_TOKEN and Config.TELEGRAM_CHAT_ID:
+        def status_callback():
+            enabled = count_accounts()
+            total = count_accounts(enabled_only=False)
+            workers_alive = sum(1 for t in worker_tasks.values() if not t.done())
+            return (
+                f"<b>VFS Monitor Status</b>\n\n"
+                f"{stats.summary()}\n"
+                f"{budget.stats_text()}\n\n"
+                f"Аккаунтов: {enabled}/{total}\n"
+                f"Воркеров: {workers_alive}\n"
+                f"Режим: {'HOT' if hot_mode_shared.get('active') else ('день' if is_daytime() else 'ночь')}\n"
+                f"Proxy: {Config.PROXY_URL.split('@')[-1] if Config.PROXY_URL else 'нет'}"
+            )
+
+        tg_bot = TelegramBot(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID, status_cb=status_callback)
+        tg_bot.start()
+        logger.info("Telegram бот запущен — управляй аккаунтами через /add, /list, /status")
 
     acct_list = ", ".join(a["email"] for a in accounts)
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
     proxy_safe = Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else (Config.PROXY_URL[:30] or "none")
     await asyncio.to_thread(notify_status,
-        f"Мониторинг запущен v5.1 ({mode})\n"
+        f"Мониторинг запущен v5.2 ({mode})\n"
         f"URL: {Config.VFS_URL}\n"
         f"Аккаунтов: {n} | {acct_list}\n"
         f"Proxy: {proxy_safe}\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
         f"Ночь: {Config.CHECK_INTERVAL_NIGHT_MIN}-{Config.CHECK_INTERVAL_NIGHT_MAX}с\n"
-        f"Timezone: UTC+{Config.TIMEZONE_OFFSET}\n"
-        f"Stack: nodriver + HumanClicker + SessionWarmer + {n}x Chrome"
+        f"TG бот: {'ON' if tg_bot else 'OFF'} | /add /list /status\n"
+        f"Stack: nodriver + HumanClicker + {n}x Chrome"
     )
-
-    hot_mode_shared = {"until": 0.0, "active": False}
 
     # Heartbeat task
     async def heartbeat_loop():
@@ -370,16 +415,30 @@ async def run_monitor():
         while running:
             await asyncio.sleep(60)
             if time.time() - last_hb >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
-                # Update hot mode state
                 if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
                     hot_mode_shared["active"] = False
                     await asyncio.to_thread(notify_status, "Hot mode закончился — слоты разобрали")
+
+                # Проверяем новые аккаунты из БД
+                db_accounts = get_enabled_accounts()
+                active_emails = {email for email in worker_tasks if not worker_tasks[email].done()}
+                for acct in db_accounts:
+                    if acct["email"] not in active_emails:
+                        if not acct.get("proxy"):
+                            acct["proxy"] = Config.PROXY_URL
+                        wid = len(worker_tasks)
+                        logger.info("Запускаю нового воркера для %s (W%d)", acct["email"], wid)
+                        t = asyncio.create_task(
+                            run_worker(wid, acct, solver, budget, stats, hot_mode_shared))
+                        worker_tasks[acct["email"]] = t
+
+                workers_alive = sum(1 for t in worker_tasks.values() if not t.done())
                 proxy_info = f"Proxy: {Config.PROXY_URL.split('@')[-1]}" if Config.PROXY_URL else "Proxy: не настроен"
                 hb = (
                     f"Heartbeat | {stats.summary()}\n"
                     f"{budget.stats_text()}\n"
                     f"{proxy_info}\n"
-                    f"Workers: {n} | Режим: {'день' if is_daytime() else 'ночь'} | "
+                    f"Workers: {workers_alive} | Режим: {'день' if is_daytime() else 'ночь'} | "
                     f"Hot: {'да' if hot_mode_shared['active'] else 'нет'}"
                 )
                 await asyncio.to_thread(notify_status, hb)
@@ -403,6 +462,7 @@ async def run_monitor():
             t = asyncio.create_task(
                 run_worker(i, acct, solver, budget, stats, hot_mode_shared))
             tasks.append(t)
+            worker_tasks[acct["email"]] = t
 
         # Wait until signal or all workers die
         done, pending = await asyncio.wait(
@@ -413,9 +473,15 @@ async def run_monitor():
     except KeyboardInterrupt:
         pass
     finally:
+        if tg_bot:
+            tg_bot.stop()
         for t in tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for t in worker_tasks.values():
+            if not t.done():
+                t.cancel()
+        all_tasks = list(set(tasks) | set(worker_tasks.values()))
+        await asyncio.gather(*all_tasks, return_exceptions=True)
         logger.info("Стоп. %s", stats.summary())
         await asyncio.to_thread(notify_status,
             f"Мониторинг остановлен\n{stats.summary()}\n{budget.stats_text()}")
