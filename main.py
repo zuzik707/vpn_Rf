@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-VFS Global Slot Detector v3.0
+VFS Global Slot Detector v4.0
 UZB → LVA | visa.vfsglobal.com/uzb/en/lva
 
-v3 changelog:
+v4 changelog:
+- HumanClicker (bezier mouse, hover, dwell)
+- SessionWarmer (homepage → country → login)
+- Fail-forward (CF backoff)
+- Traffic patterns (random skip, sign out/in, jitter ±40%)
 - Адаптивные интервалы (день/ночь/hot mode)
 - Timezone fix (Ташкент UTC+5)
 - Budget guard (circuit breaker для captcha)
 - Fallback captcha (2Captcha → CapSolver)
 - Heartbeat каждые N часов
 - Screenshot retention (auto-cleanup)
-- SessionStats persistent + captcha tracking
 """
 
 import asyncio
@@ -81,7 +84,7 @@ def validate_config() -> list[str]:
     return missing
 
 
-def get_sleep_interval(consecutive_errors: int, hot_mode: bool) -> float:
+def get_sleep_interval(consecutive_errors: int, hot_mode: bool, cf_backoff: bool = False) -> float:
     if hot_mode:
         base = random.uniform(Config.CHECK_INTERVAL_HOT_MIN, Config.CHECK_INTERVAL_HOT_MAX)
     elif is_daytime():
@@ -93,8 +96,24 @@ def get_sleep_interval(consecutive_errors: int, hot_mode: bool) -> float:
         base *= 1.5 ** min(consecutive_errors, 5)
         base = min(base, 1200)
 
-    jitter = base * random.uniform(-0.15, 0.15)
+    if cf_backoff:
+        base = max(base, 120)
+
+    # Jitter ±40% (друг рекомендовал, а не ±15%)
+    jitter = base * random.uniform(-0.4, 0.4)
     return base + jitter
+
+
+def should_random_skip() -> bool:
+    """Случайный пропуск проверки — имитация нерегулярного пользователя."""
+    return random.random() < 0.05
+
+
+def should_sign_out_cycle(checks_since_login: int) -> bool:
+    """Периодический sign out/in — как реальный пользователь."""
+    if checks_since_login < 10:
+        return False
+    return random.random() < 0.03
 
 
 def cleanup_screenshots() -> int:
@@ -151,15 +170,16 @@ async def run_monitor():
     consecutive_errors = 0
     hot_mode_until = 0.0
     last_heartbeat = time.time()
+    checks_since_login = 0
 
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
     notify_status(
-        "Мониторинг запущен v3.0\n"
+        "Мониторинг запущен v4.0\n"
         f"URL: {Config.VFS_URL}\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
         f"Ночь: {Config.CHECK_INTERVAL_NIGHT_MIN}-{Config.CHECK_INTERVAL_NIGHT_MAX}с\n"
         f"Timezone: UTC+{Config.TIMEZONE_OFFSET}\n"
-        "Stack: nodriver + 2Captcha/CapSolver + stealth + budget guard"
+        "Stack: nodriver + HumanClicker + SessionWarmer + budget guard"
     )
 
     try:
@@ -190,7 +210,14 @@ async def run_monitor():
                 last_heartbeat = time.time()
                 cleanup_screenshots()
 
+            # Random skip — как нерегулярный пользователь
+            if should_random_skip() and not (time.time() < hot_mode_until):
+                logger.info("Random skip — пропускаем проверку")
+                await asyncio.sleep(random.uniform(20, 60))
+                continue
+
             stats.checks_total += 1
+            checks_since_login += 1
             hot_now = time.time() < hot_mode_until
             logger.info("--- Проверка #%d | %s | %s ---",
                         stats.checks_total,
@@ -198,6 +225,13 @@ async def run_monitor():
                         stats.summary())
 
             try:
+                # Периодический sign out/in цикл
+                if should_sign_out_cycle(checks_since_login) and not hot_now:
+                    logger.info("Sign out/in цикл (checks_since_login=%d)", checks_since_login)
+                    await checker.close_browser()
+                    await asyncio.sleep(random.uniform(30, 90))
+                    checks_since_login = 0
+
                 if not checker.session_alive():
                     logger.info("Сессия протухла — рестарт")
                     await checker.close_browser()
@@ -206,6 +240,7 @@ async def run_monitor():
                     if not await checker.login():
                         stats.logins_failed += 1
                         raise RuntimeError("Перелогин не удался")
+                    checks_since_login = 0
 
                 found, info, screenshot = await checker.check_slots()
 
@@ -246,7 +281,11 @@ async def run_monitor():
                 "logins_total": stats.logins_total,
             })
 
-            sleep_time = get_sleep_interval(consecutive_errors, time.time() < hot_mode_until)
+            sleep_time = get_sleep_interval(
+                consecutive_errors,
+                time.time() < hot_mode_until,
+                cf_backoff=checker.should_backoff,
+            )
             logger.info("Сон %.0f сек (%s)", sleep_time,
                         "hot" if time.time() < hot_mode_until else
                         "день" if is_daytime() else "ночь")
@@ -263,8 +302,8 @@ async def run_monitor():
 def main():
     print("""
  ╔═══════════════════════════════════════════════╗
- ║   VFS Global Slot Detector v3.0               ║
- ║   UZB → LVA | nodriver + stealth + budget     ║
+ ║   VFS Global Slot Detector v4.0               ║
+ ║   UZB → LVA | HumanClicker + SessionWarmer   ║
  ╚═══════════════════════════════════════════════╝
     """)
     asyncio.run(run_monitor())

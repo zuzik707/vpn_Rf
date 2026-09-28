@@ -6,3 +6,4 @@ venv/
 .venv/
 browser_data/
 screenshots/
+dom_dumps/

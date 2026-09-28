@@ -30,7 +30,10 @@ import nodriver as uc
 
 from antidetect import get_chrome_args, inject_stealth, setup_stealth_on_new_page
 from config import Config
+from dom_dumper import dump_page
+from human_clicker import HumanClicker
 from network_interceptor import NetworkInterceptor
+from session_warmer import SessionWarmer
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +71,12 @@ class VFSBrowser:
         self.page: uc.Tab | None = None
         self.captcha_solver = captcha_solver
         self.interceptor = NetworkInterceptor()
+        self.hc: HumanClicker | None = None
+        self.warmer: SessionWarmer | None = None
         self.logged_in = False
         self.on_dashboard = False
         self.last_login_time: float = 0
+        self.cf_fail_count: int = 0
 
     # ── Browser lifecycle ──────────────────────────────────────────
 
@@ -330,22 +336,37 @@ class VFSBrowser:
         return True
 
     async def _handle_obstacle(self) -> bool:
-        """Обработка любого препятствия (CF/captcha/blocked)."""
+        """Обработка любого препятствия (CF/captcha/blocked) с fail-forward."""
         state = await self._page_state()
         if state == "blocked":
             logger.error("BLOCKED!")
             await self._screenshot("blocked")
+            await dump_page(self.page, "blocked")
+            self.cf_fail_count += 3
             return False
         if state == "cloudflare":
             if not await self._wait_cloudflare():
+                self.cf_fail_count += 1
+                if self.cf_fail_count >= 3:
+                    backoff = min(60 * self.cf_fail_count, 600)
+                    logger.warning("CF fail-forward: %d fails, backoff %ds", self.cf_fail_count, backoff)
+                    await asyncio.sleep(backoff)
                 return False
+            self.cf_fail_count = 0
             await inject_stealth(self.page)
             state = await self._page_state()
         if state == "captcha":
             if not await self._solve_turnstile():
+                self.cf_fail_count += 1
                 return False
+            self.cf_fail_count = 0
             await self._delay(2, 4)
         return True
+
+    @property
+    def should_backoff(self) -> bool:
+        """True если много CF fails — main.py должен увеличить интервал."""
+        return self.cf_fail_count >= 3
 
     # ── Select dropdown by visible text ────────────────────────────
 
@@ -484,10 +505,16 @@ class VFSBrowser:
 
         self.page = await self.browser.get("about:blank")
         await setup_stealth_on_new_page(self.page)
+        self.hc = HumanClicker(self.page)
+        self.warmer = SessionWarmer(self.page, self.hc)
         await self._delay(0.5, 1.0)
 
-        logger.info("Открываю %s", Config.VFS_URL)
-        await self.page.get(Config.VFS_URL)
+        # Session warming: homepage → country → login (не прямой /login)
+        logger.info("Session warming → %s", Config.VFS_URL)
+        warmed = await self.warmer.warm()
+        if not warmed:
+            logger.warning("Warming failed, прямой заход")
+            await self.page.get(Config.VFS_URL)
         await self._delay(3, 5)
         await inject_stealth(self.page)
 
@@ -546,7 +573,11 @@ class VFSBrowser:
                     await self._screenshot("no_email")
                     return False
 
-                await email_el.click()
+                if self.hc:
+                    await self.hc.scroll_into_view(email_el)
+                    await self.hc.click(email_el)
+                else:
+                    await email_el.click()
                 await self._delay(0.3, 0.6)
                 await self._human_type(email_el, Config.VFS_EMAIL)
                 await self._delay(0.6, 1.2)
@@ -561,7 +592,10 @@ class VFSBrowser:
                     await self._screenshot("no_pwd")
                     return False
 
-                await pwd_el.click()
+                if self.hc:
+                    await self.hc.click(pwd_el)
+                else:
+                    await pwd_el.click()
                 await self._delay(0.3, 0.6)
                 await self._human_type(pwd_el, Config.VFS_PASSWORD)
                 await self._delay(0.6, 1.2)
@@ -650,12 +684,23 @@ class VFSBrowser:
             return False, "Не удалось попасть на dashboard", None
 
         # Шаг 2: Кликаем "Start New Booking"
+        # Из реального F12: button.btn-brand-orange.mat-mdc-raised-button
         await self._delay(1, 2)
-        clicked = await self._click([
-            "button:has-text('Start New Booking')",
-            "a:has-text('Start New Booking')",
+
+        # PRIMARY: HumanClicker на реальную кнопку
+        snb_el = await self._find_input([
+            "button.btn-brand-orange.mat-mdc-raised-button",
+            "button.btn-brand-orange",
+            "button[mat-raised-button].btn-brand-orange",
         ])
-        if not clicked:
+        if snb_el and self.hc:
+            await self.hc.micro_scroll()
+            await self.hc.click(snb_el, dwell=random.uniform(0.1, 0.3))
+            clicked = True
+        elif snb_el:
+            await snb_el.click()
+            clicked = True
+        else:
             # Fallback: ищем кнопку по тексту через JS
             clicked = await self.page.evaluate("""
                 (() => {
@@ -782,8 +827,9 @@ class VFSBrowser:
         if "no appointment" in text or "sorry" in text:
             return False, "Нет слотов (текст)", None
 
-        # Неясно — скриншот для анализа
+        # Неясно — скриншот + DOM dump для анализа
         screenshot = await self._screenshot("unclear")
+        await dump_page(self.page, "unclear")
         return False, f"Неясный результат: {text[:200]}", screenshot
 
     async def _ensure_dashboard(self) -> bool:
