@@ -289,25 +289,48 @@ class VFSRegistrar:
 
             await self._delay(0.5, 1.0)
 
-            # Ставим все 3 чекбокса (кликаем label чтобы Angular увидел)
-            await self.page.evaluate("""
-                (() => {
-                    const names = ['processPerDataAgreed', 'intTransPerDataAgreed', 'termAndConditionAgreed'];
-                    for (const name of names) {
-                        const cb = document.querySelector('mat-checkbox[formcontrolname="' + name + '"]');
-                        if (cb) {
+            # Ставим все 3 чекбокса
+            for cb_name in ['processPerDataAgreed', 'intTransPerDataAgreed', 'termAndConditionAgreed']:
+                await self.page.evaluate(f"""
+                    (() => {{
+                        const cb = document.querySelector('mat-checkbox[formcontrolname="{cb_name}"]');
+                        if (cb) {{
                             const inner = cb.querySelector('input[type="checkbox"]');
-                            if (inner && !inner.checked) {
-                                const label = cb.querySelector('label') || cb;
-                                label.click();
-                            }
-                        }
-                    }
-                })()
-            """)
+                            if (inner && !inner.checked) {{
+                                cb.click();
+                            }}
+                        }}
+                    }})()
+                """)
+                await self._delay(0.3, 0.5)
 
             await self._delay(1, 2)
             await self._screenshot("reg_form_filled")
+
+            # Диагностика: какие поля ещё невалидны
+            diag = await self.page.evaluate("""
+                (() => {
+                    const fields = ['emailid', 'password', 'confirmPassword', 'dialcode', 'contact',
+                                    'processPerDataAgreed', 'intTransPerDataAgreed', 'termAndConditionAgreed'];
+                    const result = {};
+                    for (const f of fields) {
+                        const el = document.querySelector('[formcontrolname="' + f + '"]');
+                        if (!el) {
+                            result[f] = 'NOT_FOUND';
+                        } else if (el.classList.contains('ng-invalid')) {
+                            result[f] = 'INVALID (value: ' + (el.value || el.textContent || '').substring(0, 30) + ')';
+                        } else {
+                            result[f] = 'OK';
+                        }
+                    }
+                    const btn = document.querySelector('button#trigger, button[type="submit"]');
+                    result['submit_disabled'] = btn ? btn.disabled : 'NO_BUTTON';
+                    const ts = document.querySelector('[name="cf-turnstile-response"]');
+                    result['turnstile'] = (ts && ts.value && ts.value.length > 20) ? 'OK' : 'MISSING';
+                    return JSON.stringify(result);
+                })()
+            """)
+            logger.info("Form diagnostics: %s", diag)
 
             # Ждём Turnstile
             for _ in range(10):
@@ -343,9 +366,10 @@ class VFSRegistrar:
             """)
 
             if submitted == "disabled":
-                await self._screenshot("reg_submit_disabled")
-                return {"success": False, "error": "Кнопка Submit заблокирована — проверь форму",
-                        "screenshot": await self._screenshot("reg_submit_disabled")}
+                screenshot = await self._screenshot("reg_submit_disabled")
+                return {"success": False,
+                        "error": f"Кнопка Submit заблокирована.\nДиагностика: {diag}",
+                        "screenshot": screenshot}
 
             if submitted == "not_found":
                 await self._screenshot("reg_no_submit")
