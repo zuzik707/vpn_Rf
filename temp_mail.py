@@ -84,7 +84,6 @@ class TempMailClient:
         )
         if resp.status_code == 422:
             # Адрес занят — пробуем с рандомным суффиксом
-            import random
             self.address = f"{prefix}{random.randint(100,999)}@{domain}"
             resp = self._session.post(
                 f"{BASE_URL}/accounts",
