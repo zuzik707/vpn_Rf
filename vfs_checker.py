@@ -196,10 +196,9 @@ class VFSBrowser:
 
     async def _setup_proxy_auth(self, page, username: str, password: str) -> None:
         """Handle proxy authentication via CDP Fetch domain.
-        Disables Fetch after first auth to reduce CDP timing footprint."""
+        Keeps Fetch enabled for the entire session — Bright Data requires auth on every request."""
         try:
             import nodriver.cdp.fetch as fetch_cdp
-            auth_done = {"count": 0}
 
             await page.send(fetch_cdp.enable(handle_auth_requests=True, patterns=[
                 fetch_cdp.RequestPattern(request_stage=fetch_cdp.RequestStage.RESPONSE),
@@ -207,7 +206,6 @@ class VFSBrowser:
 
             def on_auth(event: fetch_cdp.AuthRequired):
                 import asyncio
-                auth_done["count"] += 1
                 asyncio.ensure_future(page.send(
                     fetch_cdp.continue_with_auth(
                         request_id=event.request_id,
@@ -227,16 +225,7 @@ class VFSBrowser:
 
             page.add_handler(fetch_cdp.AuthRequired, on_auth)
             page.add_handler(fetch_cdp.RequestPaused, on_request_paused)
-            logger.info("Proxy auth configured via CDP Fetch")
-
-            # Auth happens on first request — navigate, wait, then disable Fetch
-            await page.get("https://visa.vfsglobal.com/favicon.ico")
-            await asyncio.sleep(2)
-            try:
-                await page.send(fetch_cdp.disable())
-                logger.info("Proxy auth done (count=%d), Fetch disabled", auth_done["count"])
-            except Exception:
-                pass
+            logger.info("Proxy auth configured via CDP Fetch (persistent)")
         except Exception as e:
             logger.warning("Proxy auth setup failed: %s — proxy may not require auth", e)
 
@@ -648,20 +637,8 @@ class VFSBrowser:
         return True
 
     async def _ensure_proxy_auth(self) -> None:
-        """Re-enable proxy auth if connection dropped during long sessions."""
-        if not self._proxy_auth or not self.page:
-            return
-        try:
-            ip_check = await self.page.evaluate(
-                "fetch('https://httpbin.org/ip',{signal:AbortSignal.timeout(8000)})"
-                ".then(r=>r.json()).then(d=>d.origin).catch(()=>null)"
-            )
-            if ip_check:
-                return
-            logger.warning("Proxy health check failed — re-enabling auth")
-            await self._setup_proxy_auth(self.page, *self._proxy_auth)
-        except Exception as e:
-            logger.debug("Proxy health check error: %s", e)
+        """No-op — Fetch stays enabled for the entire session now."""
+        pass
 
     @property
     def should_backoff(self) -> bool:
