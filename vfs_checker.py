@@ -382,7 +382,9 @@ class VFSBrowser:
     async def _wait_cloudflare(self, timeout: int = 90) -> bool:
         logger.info("Cloudflare challenge — ждём до %dс...", timeout)
         t0 = time.time()
-        click_attempted = False
+        click_count = 0
+        max_clicks = 5
+        next_click_at = 8
         solve_attempted = False
         while time.time() - t0 < timeout:
             if self.hc:
@@ -394,14 +396,15 @@ class VFSBrowser:
                 logger.info("Cloudflare пройден (%.0fс)", time.time() - t0)
                 return True
             elapsed = time.time() - t0
-            if not click_attempted and elapsed > 5:
-                click_attempted = True
-                logger.info("CF: trying Turnstile click...")
+            if click_count < max_clicks and elapsed > next_click_at:
+                click_count += 1
+                logger.info("CF: trying Turnstile click (%d/%d)...", click_count, max_clicks)
                 if await self._try_turnstile_click():
                     if await self._page_state() not in ("cloudflare", "captcha"):
                         logger.info("Cloudflare пройден кликом (%.0fс)", time.time() - t0)
                         return True
-            if not solve_attempted and elapsed > 20:
+                next_click_at = elapsed + random.uniform(8, 14)
+            if not solve_attempted and elapsed > 40:
                 solve_attempted = True
                 logger.info("CF: trying Turnstile API solve...")
                 if await self._solve_turnstile():
@@ -415,70 +418,127 @@ class VFSBrowser:
     async def _extract_sitekey(self) -> str | None:
         return await self.page.evaluate("""
             (() => {
-                // 1. data-sitekey на виджете
+                // 1. data-sitekey attribute
                 let el = document.querySelector('[data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
                 el = document.querySelector('.cf-turnstile[data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
-                // 2. VFS оборачивает в <app-cloudflare-captcha-container> → <div appcloudflarerecaptcha>
+                // 2. VFS Angular wrapper
                 el = document.querySelector('[appcloudflarerecaptcha] [data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
-                // 3. iframe URL
-                const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-                if (iframe) {
-                    const m = iframe.src.match(/[?&]k=([^&]+)/);
-                    if (m) return m[1];
+                // Also check app-cloudflare-captcha-container
+                el = document.querySelector('app-cloudflare-captcha-container [data-sitekey]');
+                if (el) return el.getAttribute('data-sitekey');
+                // 3. iframe URL param
+                for (const iframe of document.querySelectorAll('iframe')) {
+                    if (iframe.src && iframe.src.includes('challenges.cloudflare.com')) {
+                        const m = iframe.src.match(/[?&]k=([^&]+)/);
+                        if (m) return m[1];
+                    }
                 }
-                // 4. Inline script
+                // 4. window.turnstile state (if Turnstile JS is loaded)
+                try {
+                    if (window.turnstile && window.turnstile._widgets) {
+                        for (const [k, v] of Object.entries(window.turnstile._widgets)) {
+                            if (v && v.sitekey) return v.sitekey;
+                        }
+                    }
+                } catch(e) {}
+                // 5. Inline scripts — sitekey assignment
                 for (const s of document.querySelectorAll('script')) {
                     if (!s.textContent) continue;
                     const m = s.textContent.match(/sitekey['"]?\\s*[:=]\\s*['"]([0-9a-zA-Z_-]{20,})['"]/);
                     if (m) return m[1];
                 }
-                // 5. Turnstile render call
+                // 6. Turnstile.render call
                 for (const s of document.querySelectorAll('script')) {
                     if (!s.textContent) continue;
                     const m = s.textContent.match(/turnstile\\.render[^}]*sitekey['"]?\\s*:\\s*['"]([^'"]+)['"]/);
                     if (m) return m[1];
+                }
+                // 7. Check all elements with any sitekey-like attribute
+                for (const el of document.querySelectorAll('*')) {
+                    for (const attr of el.attributes || []) {
+                        if (attr.name.toLowerCase().includes('sitekey') && attr.value.length > 15) {
+                            return attr.value;
+                        }
+                    }
                 }
                 return null;
             })()
         """)
 
     async def _try_turnstile_click(self) -> bool:
-        """Try clicking the real Turnstile checkbox before falling back to API.
-        Real users click the widget — only bots go straight to API solving."""
+        """Try clicking the real Turnstile checkbox."""
         try:
-            has_iframe = await self.page.evaluate("""
+            widget_info = await self.page.evaluate("""
                 (() => {
-                    const iframe = document.querySelector(
+                    // Look for Turnstile iframe
+                    let iframe = document.querySelector(
                         'iframe[src*="challenges.cloudflare.com"]'
                     );
+                    // Also check inside shadow roots and Angular wrappers
+                    if (!iframe) {
+                        const containers = document.querySelectorAll(
+                            '.cf-turnstile, [appcloudflarerecaptcha], app-cloudflare-captcha-container, [data-sitekey]'
+                        );
+                        for (const c of containers) {
+                            iframe = c.querySelector('iframe');
+                            if (iframe) break;
+                            if (c.shadowRoot) {
+                                iframe = c.shadowRoot.querySelector('iframe');
+                                if (iframe) break;
+                            }
+                        }
+                    }
+                    // Also try any iframe with cloudflare in src
+                    if (!iframe) {
+                        for (const f of document.querySelectorAll('iframe')) {
+                            if (f.src && (f.src.includes('cloudflare') || f.src.includes('turnstile'))) {
+                                iframe = f;
+                                break;
+                            }
+                        }
+                    }
                     if (!iframe) return null;
                     const r = iframe.getBoundingClientRect();
-                    if (r.width < 10 || r.height < 10) return null;
+                    if (r.width < 5 || r.height < 5) return null;
                     return {x: r.x, y: r.y, w: r.width, h: r.height};
                 })()
             """)
-            if not has_iframe or not isinstance(has_iframe, dict):
+            if not widget_info or not isinstance(widget_info, dict):
+                logger.debug("Turnstile iframe not found in DOM")
                 return False
+
+            # Click the checkbox area (left side of the widget)
+            cx = widget_info["x"] + min(widget_info["w"] * 0.15, 30)
+            cy = widget_info["y"] + widget_info["h"] * 0.5
+            logger.debug("Turnstile iframe at (%.0f,%.0f) size %dx%d, clicking (%.0f,%.0f)",
+                         widget_info["x"], widget_info["y"],
+                         widget_info["w"], widget_info["h"], cx, cy)
 
             if self.hc:
-                tx = has_iframe["x"] + has_iframe["w"] * 0.15
-                ty = has_iframe["y"] + has_iframe["h"] * 0.5
-                await self.hc._move_to(tx, ty)
+                await self.hc._move_to(cx, cy)
                 await asyncio.sleep(random.uniform(0.3, 0.8))
-                await self.hc._mouse_down(tx, ty)
-                await asyncio.sleep(random.uniform(0.05, 0.12))
-                await self.hc._mouse_up(tx, ty)
+                await self.hc._mouse_down(cx, cy)
+                await asyncio.sleep(random.uniform(0.05, 0.15))
+                await self.hc._mouse_up(cx, cy)
             else:
-                return False
+                # Fallback: CDP Input.dispatchMouseEvent
+                import nodriver.cdp.input_ as cdp_input
+                await self.page.send(cdp_input.dispatch_mouse_event(
+                    type_="mousePressed", x=cx, y=cy, button=cdp_input.MouseButton.LEFT,
+                    click_count=1))
+                await asyncio.sleep(0.08)
+                await self.page.send(cdp_input.dispatch_mouse_event(
+                    type_="mouseReleased", x=cx, y=cy, button=cdp_input.MouseButton.LEFT,
+                    click_count=1))
 
-            for _ in range(8):
+            for _ in range(6):
                 await asyncio.sleep(2)
                 state = await self._page_state()
                 if state not in ("captcha", "cloudflare"):
-                    logger.info("Turnstile solved by real click")
+                    logger.info("Turnstile solved by click")
                     return True
                 token_filled = await self.page.evaluate("""
                     (() => {
@@ -500,7 +560,17 @@ class VFSBrowser:
 
         sitekey = await self._extract_sitekey()
         if not sitekey:
-            logger.error("sitekey не найден")
+            cf_debug = await self.page.evaluate("""
+                (() => {
+                    const iframes = [...document.querySelectorAll('iframe')].map(
+                        f => ({src: f.src?.substring(0, 120), w: f.offsetWidth, h: f.offsetHeight}));
+                    const cfs = [...document.querySelectorAll(
+                        '.cf-turnstile, [appcloudflarerecaptcha], app-cloudflare-captcha-container, [data-sitekey]'
+                    )].map(e => e.tagName + (e.className ? '.' + e.className : ''));
+                    return JSON.stringify({iframes: iframes.slice(0, 5), cf_els: cfs.slice(0, 5)});
+                })()
+            """)
+            logger.error("sitekey не найден — CF elements: %s", cf_debug)
             await self._screenshot("no_sitekey")
             return False
 
