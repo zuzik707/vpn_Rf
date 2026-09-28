@@ -86,12 +86,19 @@ class SessionWarmer:
             try:
                 links = await self.page.select_all("a[href]")
                 if links:
-                    random.choice(links[:10])
+                    link = random.choice(links[:10])
                     if self.hc:
-                        await self.hc._move_to(
-                            random.uniform(200, 800),
-                            random.uniform(200, 500),
-                        )
+                        box = await self.hc._get_box(link)
+                        if box:
+                            await self.hc._move_to(
+                                box["x"] + box["w"] / 2,
+                                box["y"] + box["h"] / 2,
+                            )
+                        else:
+                            await self.hc._move_to(
+                                random.uniform(200, 800),
+                                random.uniform(200, 500),
+                            )
                     await asyncio.sleep(random.uniform(0.3, 0.8))
             except Exception:
                 pass

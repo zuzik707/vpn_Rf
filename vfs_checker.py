@@ -289,7 +289,12 @@ class VFSBrowser:
         if not token:
             return False
 
-        safe = token.replace("\\", "\\\\").replace("'", "\\'")
+        safe = (token
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("</", "<\\/"))
         await self.page.evaluate(f"""
             (() => {{
                 // VFS: hidden input name="cf-turnstile-response" внутри
@@ -442,7 +447,7 @@ class VFSBrowser:
             return True
 
         # Кликаем mat-select чтобы открыть overlay
-        el = await self.page.query_selector(f'mat-select[formcontrolname="{safe_fcn}"]')
+        el = await self.page.select(f'mat-select[formcontrolname="{safe_fcn}"]')
         if not el:
             logger.debug("mat-select[formcontrolname=%s] не найден", formcontrolname)
             return False
@@ -749,6 +754,7 @@ class VFSBrowser:
     async def _check_single_subcategory(self, subcategory: str) -> tuple[bool, str, str | None]:
         """Проверяем конкретную подкатегорию."""
         logger.info("Проверяю: %s", subcategory)
+        self.interceptor.clear()
 
         # Шаг 1: Убеждаемся что мы на dashboard
         if not await self._ensure_dashboard():
@@ -974,7 +980,7 @@ class VFSBrowser:
     async def _find_input(self, selectors: list[str]):
         for s in selectors:
             try:
-                el = await self.page.query_selector(s)
+                el = await self.page.select(s)
                 if el:
                     return el
             except Exception:
@@ -985,21 +991,21 @@ class VFSBrowser:
         """Находит input, пропуская honeypot'ы (d-none, aria-hidden, offsetParent null)."""
         for s in selectors:
             try:
-                el = await self.page.query_selector(s)
+                el = await self.page.select(s)
                 if not el:
                     continue
-                # Дополнительная проверка видимости через JS
-                visible = await self.page.evaluate("""
-                    (sel) => {
-                        const el = document.querySelector(sel);
+                safe_s = s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+                visible = await self.page.evaluate(f"""
+                    (() => {{
+                        const el = document.querySelector('{safe_s}');
                         if (!el) return false;
                         if (el.classList.contains('d-none')) return false;
                         if (el.getAttribute('aria-hidden') === 'true') return false;
                         if (el.offsetParent === null && el.style.position !== 'fixed') return false;
                         const rect = el.getBoundingClientRect();
                         return rect.width > 0 && rect.height > 0;
-                    }
-                """, s)
+                    }})()
+                """)
                 if visible:
                     return el
             except Exception:
@@ -1009,7 +1015,7 @@ class VFSBrowser:
     async def _click(self, selectors: list[str]) -> bool:
         for s in selectors:
             try:
-                el = await self.page.query_selector(s)
+                el = await self.page.select(s)
                 if el:
                     await el.click()
                     return True

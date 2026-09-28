@@ -10,7 +10,6 @@ Human-like mouse/keyboard interaction через CDP Input events.
 """
 
 import asyncio
-import math
 import random
 
 import nodriver.cdp.input_ as inp

@@ -151,9 +151,9 @@ async def run_monitor():
     proxy = ProxyManager()
     if proxy.is_configured:
         try:
-            proxy_url = proxy.setup_best_proxy()
+            proxy_url = await asyncio.to_thread(proxy.setup_best_proxy)
             Config.PROXY_URL = proxy_url
-            logger.info("AstroProxy: %s", proxy.stats_text())
+            logger.info("AstroProxy: %s", await asyncio.to_thread(proxy.stats_text))
         except Exception as e:
             logger.warning("AstroProxy setup failed: %s", e)
     elif Config.PROXY_URL:
@@ -165,7 +165,7 @@ async def run_monitor():
     from captcha_solver import CaptchaSolver
     try:
         solver = CaptchaSolver(budget)
-        balance = solver.get_balance()
+        balance = await asyncio.to_thread(solver.get_balance)
         if balance >= 0:
             logger.info("2Captcha баланс: $%.2f", balance)
     except Exception as e:
@@ -188,7 +188,7 @@ async def run_monitor():
     checks_since_login = 0
 
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
-    notify_status(
+    await asyncio.to_thread(notify_status,
         "Мониторинг запущен v4.0\n"
         f"URL: {Config.VFS_URL}\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
@@ -202,7 +202,7 @@ async def run_monitor():
         if not await checker.login():
             stats.logins_failed += 1
             logger.error("Первый логин не удался")
-            notify_error("Первый логин не удался. Проверь VFS_EMAIL/VFS_PASSWORD.")
+            await asyncio.to_thread(notify_error, "Первый логин не удался. Проверь VFS_EMAIL/VFS_PASSWORD.")
         else:
             logger.info("Первый логин OK")
 
@@ -215,7 +215,7 @@ async def run_monitor():
 
             # Heartbeat
             if time.time() - last_heartbeat >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
-                proxy_info = proxy.stats_text() if proxy.is_configured else "Proxy: не настроен"
+                proxy_info = (await asyncio.to_thread(proxy.stats_text)) if proxy.is_configured else "Proxy: не настроен"
                 heartbeat_msg = (
                     f"Heartbeat | {stats.summary()}\n"
                     f"{budget.stats_text()}\n"
@@ -223,7 +223,7 @@ async def run_monitor():
                     f"Режим: {'день' if is_daytime() else 'ночь'} | "
                     f"Hot: {'да' if time.time() < hot_mode_until else 'нет'}"
                 )
-                notify_status(heartbeat_msg)
+                await asyncio.to_thread(notify_status, heartbeat_msg)
                 last_heartbeat = time.time()
                 cleanup_screenshots()
 
@@ -238,7 +238,7 @@ async def run_monitor():
             was_hot = hot_mode_until > 0
             hot_now = time.time() < hot_mode_until
             if was_hot and not hot_now:
-                notify_status("Hot mode закончился — слоты разобрали")
+                await asyncio.to_thread(notify_status, "Hot mode закончился — слоты разобрали")
                 hot_mode_until = 0.0
             logger.info("--- Проверка #%d | %s | %s ---",
                         stats.checks_total,
@@ -269,7 +269,7 @@ async def run_monitor():
                     stats.checks_success += 1
                     stats.slots_found_count += 1
                     logger.info("СЛОТЫ: %s", info)
-                    notify_slots_found(info, screenshot)
+                    await asyncio.to_thread(notify_slots_found, info, screenshot)
                     hot_mode_until = time.time() + Config.HOT_MODE_DURATION
                     consecutive_errors = 0
                 else:
@@ -285,14 +285,14 @@ async def run_monitor():
                     logger.info("3 ошибки подряд — полный рестарт")
                     # Ротация IP при повторных ошибках
                     if proxy.is_configured:
-                        new_ip = proxy.rotate_ip()
+                        new_ip = await asyncio.to_thread(proxy.rotate_ip)
                         if new_ip:
                             logger.info("IP ротация после ошибок: %s", new_ip)
                     await checker.close_browser()
                     await asyncio.sleep(random.uniform(30, 60))
 
                 if consecutive_errors >= 5:
-                    notify_error(f"5 ошибок подряд: {e}\n{stats.summary()}")
+                    await asyncio.to_thread(notify_error, f"5 ошибок подряд: {e}\n{stats.summary()}")
                     consecutive_errors = 0
                     await checker.close_browser()
                     await asyncio.sleep(random.uniform(300, 600))
@@ -320,7 +320,7 @@ async def run_monitor():
     finally:
         await checker.close_browser()
         logger.info("Стоп. %s", stats.summary())
-        notify_status(f"Мониторинг остановлен\n{stats.summary()}\n{budget.stats_text()}")
+        await asyncio.to_thread(notify_status, f"Мониторинг остановлен\n{stats.summary()}\n{budget.stats_text()}")
 
 
 def main():
