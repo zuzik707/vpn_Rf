@@ -596,9 +596,10 @@ class VFSBrowser:
 
     async def _select_html_dropdown(self, option_text: str) -> bool:
         """Fallback: обычные HTML <select> элементы."""
+        safe_text = option_text.replace("\\", "\\\\").replace("'", "\\'")
         return await self.page.evaluate(f"""
             (() => {{
-                const target = '{option_text.replace("'", "\\'")}';
+                const target = '{safe_text}';
                 const selects = document.querySelectorAll('select');
                 for (const sel of selects) {{
                     for (const opt of sel.options) {{
