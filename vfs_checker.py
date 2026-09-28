@@ -309,6 +309,9 @@ class VFSBrowser:
                     const blocked = """ + blocked_json + """;
                     const cfMarkers = """ + cf_json + """;
                     if (blocked.some(m => both.includes(m))) return 'blocked';
+                    if (both.includes('session expired') || both.includes('session invalid') ||
+                        both.includes('session has expired'))
+                        return 'session_expired';
                     if (url.includes('challenges.cloudflare.com') || url.includes('/cdn-cgi/'))
                         return 'cloudflare';
                     if (cfMarkers.some(m => both.includes(m))) return 'cloudflare';
@@ -553,13 +556,23 @@ class VFSBrowser:
         return True
 
     async def _handle_obstacle(self) -> bool:
-        """Обработка любого препятствия (CF/captcha/blocked) с fail-forward."""
+        """Обработка любого препятствия (CF/captcha/blocked/session_expired) с fail-forward."""
         state = await self._page_state()
         if state == "blocked":
             logger.error("BLOCKED!")
             await self._screenshot("blocked")
             await dump_page(self.page, "blocked")
             self.cf_fail_count += 3
+            return False
+        if state == "session_expired":
+            logger.warning("Session expired — clearing cookies and restarting")
+            try:
+                if os.path.exists(self._cookies_path):
+                    os.remove(self._cookies_path)
+                    logger.info("Stale cookies deleted: %s", self._cookies_path)
+            except OSError:
+                pass
+            self._session_ts = 0
             return False
         if state == "cloudflare":
             if not await self._wait_cloudflare():
