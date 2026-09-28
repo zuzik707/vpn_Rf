@@ -357,6 +357,32 @@ class VFSBrowser:
         except Exception:
             return ""
 
+    async def _dismiss_cookie_banner(self) -> None:
+        """Click 'Accept All Cookies' if the cookie consent banner is present."""
+        try:
+            dismissed = await self.page.evaluate("""
+                (() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        const t = b.textContent.trim().toLowerCase();
+                        if (t.includes('accept all') || t.includes('accept cookies') ||
+                            t === 'accept' || t.includes('agree')) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    // Also try OneTrust / CookiePro patterns
+                    const accept = document.querySelector('#onetrust-accept-btn-handler, .accept-all-btn, [data-testid="accept-all"]');
+                    if (accept) { accept.click(); return true; }
+                    return false;
+                })()
+            """)
+            if dismissed:
+                logger.info("Cookie banner dismissed")
+                await self._delay(0.5, 1.0)
+        except Exception:
+            pass
+
     async def _page_state(self) -> str:
         """Single CDP round-trip to determine current page state."""
         blocked_json = json.dumps(BLOCKED_MARKERS)
@@ -374,20 +400,10 @@ class VFSBrowser:
                     if (both.includes('session expired') || both.includes('session invalid') ||
                         both.includes('session has expired'))
                         return 'session_expired';
-                    if (url.includes('challenges.cloudflare.com') || url.includes('/cdn-cgi/'))
-                        return 'cloudflare';
-                    if (cfMarkers.some(m => both.includes(m))) return 'cloudflare';
-                    const hasCaptcha = !!(
-                        document.querySelector('.cf-turnstile') ||
-                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
-                        document.querySelector('[data-sitekey]') ||
-                        document.querySelector('.h-captcha') ||
-                        document.querySelector('.g-recaptcha')
-                    );
-                    if (hasCaptcha) return 'captcha';
-                    if (url.includes('/login') &&
-                        document.querySelector('input[type="password"]'))
-                        return 'login';
+                    // Login page with embedded Turnstile — detect as 'login', not 'cloudflare'
+                    const hasLoginForm = url.includes('/login') &&
+                        document.querySelector('input[type="password"]');
+                    if (hasLoginForm) return 'login';
                     const hasSNB = [...document.querySelectorAll('button, a')]
                         .some(e => e.textContent.toLowerCase().includes('start new booking'));
                     if (hasSNB) return 'dashboard';
@@ -405,6 +421,18 @@ class VFSBrowser:
                         both.includes('password')) return 'login';
                     if (both.includes('sign out') || both.includes('my account'))
                         return 'logged_in';
+                    // CF interstitial (no login form, no dashboard — pure challenge page)
+                    if (url.includes('challenges.cloudflare.com') || url.includes('/cdn-cgi/'))
+                        return 'cloudflare';
+                    if (cfMarkers.some(m => both.includes(m))) return 'cloudflare';
+                    const hasCaptcha = !!(
+                        document.querySelector('.cf-turnstile') ||
+                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+                        document.querySelector('[data-sitekey]') ||
+                        document.querySelector('.h-captcha') ||
+                        document.querySelector('.g-recaptcha')
+                    );
+                    if (hasCaptcha) return 'captcha';
                     return 'unknown';
                 })()
             """)
@@ -1059,6 +1087,8 @@ class VFSBrowser:
                 continue
 
             if state == "login":
+                # Dismiss cookie consent banner if present
+                await self._dismiss_cookie_banner()
                 # HONEYPOT ALERT: VFS имеет скрытые input'ы с class="d-none"
                 # #username, #username1, #password1 — ловушки!
                 # Реальные поля: #email (formcontrolname="username"), #password
