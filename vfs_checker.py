@@ -457,6 +457,7 @@ class VFSBrowser:
             state = await self._page_state()
             if state not in ("cloudflare", "captcha"):
                 logger.info("Cloudflare пройден (%.0fс)", time.time() - t0)
+                await self._screenshot("cf_passed")
                 return True
             elapsed = time.time() - t0
             # Wait for Turnstile widget to become visible (CF shows "please wait" first)
@@ -490,32 +491,28 @@ class VFSBrowser:
         return False
 
     async def _is_turnstile_visible(self) -> bool:
-        """Check if Turnstile iframe has rendered (non-zero size)."""
+        """Check if Turnstile widget has rendered (iframe OR container with visible size)."""
         try:
             return await self.page.evaluate("""
                 (() => {
+                    // 1. Cloudflare iframe with non-zero size
                     for (const f of document.querySelectorAll('iframe')) {
                         if (f.src && (f.src.includes('challenges.cloudflare.com') || f.src.includes('turnstile'))) {
                             const r = f.getBoundingClientRect();
-                            return r.width > 10 && r.height > 10;
-                        }
-                    }
-                    // Check if any container has visible content
-                    const containers = document.querySelectorAll(
-                        '.cf-turnstile, [appcloudflarerecaptcha], app-cloudflare-captcha-container'
-                    );
-                    for (const c of containers) {
-                        // Look for iframe inside (might have empty src initially)
-                        const iframe = c.querySelector('iframe');
-                        if (iframe) {
-                            const r = iframe.getBoundingClientRect();
                             if (r.width > 10 && r.height > 10) return true;
                         }
-                        // Check if container itself has a rendered checkbox
+                    }
+                    // 2. Container with visible size (VFS Angular wraps Turnstile)
+                    const containers = document.querySelectorAll(
+                        '.cf-turnstile, [appcloudflarerecaptcha], app-cloudflare-captcha-container, [data-sitekey]'
+                    );
+                    for (const c of containers) {
                         const r = c.getBoundingClientRect();
-                        if (r.width > 50 && r.height > 30) {
-                            // Container visible but iframe not yet — check for shadow content
-                            if (c.querySelector('[data-sitekey]')) return true;
+                        if (r.width > 50 && r.height > 30) return true;
+                        const iframe = c.querySelector('iframe');
+                        if (iframe) {
+                            const ir = iframe.getBoundingClientRect();
+                            if (ir.width > 10 && ir.height > 10) return true;
                         }
                     }
                     return false;
@@ -578,53 +575,59 @@ class VFSBrowser:
         """)
 
     async def _try_turnstile_click(self) -> bool:
-        """Try clicking the real Turnstile checkbox."""
+        """Try clicking the Turnstile checkbox — iframe or container."""
         try:
             widget_info = await self.page.evaluate("""
                 (() => {
-                    // Look for Turnstile iframe
-                    let iframe = document.querySelector(
-                        'iframe[src*="challenges.cloudflare.com"]'
-                    );
-                    // Also check inside shadow roots and Angular wrappers
-                    if (!iframe) {
-                        const containers = document.querySelectorAll(
-                            '.cf-turnstile, [appcloudflarerecaptcha], app-cloudflare-captcha-container, [data-sitekey]'
-                        );
-                        for (const c of containers) {
-                            iframe = c.querySelector('iframe');
-                            if (iframe) break;
-                            if (c.shadowRoot) {
-                                iframe = c.shadowRoot.querySelector('iframe');
-                                if (iframe) break;
-                            }
+                    // 1. Try visible iframe first
+                    for (const f of document.querySelectorAll('iframe')) {
+                        if (f.src && (f.src.includes('challenges.cloudflare.com') || f.src.includes('turnstile'))) {
+                            const r = f.getBoundingClientRect();
+                            if (r.width > 10 && r.height > 10)
+                                return {x: r.x, y: r.y, w: r.width, h: r.height, type: 'iframe'};
                         }
                     }
-                    // Also try any iframe with cloudflare in src
-                    if (!iframe) {
-                        for (const f of document.querySelectorAll('iframe')) {
-                            if (f.src && (f.src.includes('cloudflare') || f.src.includes('turnstile'))) {
-                                iframe = f;
-                                break;
-                            }
+                    // 2. Try Turnstile container (VFS wraps it in Angular component)
+                    const containers = [
+                        ...document.querySelectorAll('app-cloudflare-captcha-container'),
+                        ...document.querySelectorAll('.cf-turnstile'),
+                        ...document.querySelectorAll('[appcloudflarerecaptcha]'),
+                        ...document.querySelectorAll('[data-sitekey]'),
+                    ];
+                    for (const c of containers) {
+                        const r = c.getBoundingClientRect();
+                        if (r.width > 20 && r.height > 20)
+                            return {x: r.x, y: r.y, w: r.width, h: r.height, type: 'container'};
+                        // Check child elements
+                        const inner = c.querySelector('div, iframe');
+                        if (inner) {
+                            const ir = inner.getBoundingClientRect();
+                            if (ir.width > 20 && ir.height > 20)
+                                return {x: ir.x, y: ir.y, w: ir.width, h: ir.height, type: 'inner'};
                         }
                     }
-                    if (!iframe) return null;
-                    const r = iframe.getBoundingClientRect();
-                    if (r.width < 5 || r.height < 5) return null;
-                    return {x: r.x, y: r.y, w: r.width, h: r.height};
+                    // 3. Any iframe at all (even without matching src)
+                    for (const f of document.querySelectorAll('iframe')) {
+                        const r = f.getBoundingClientRect();
+                        if (r.width > 30 && r.height > 30) {
+                            const parent = f.closest('app-cloudflare-captcha-container, .cf-turnstile, [appcloudflarerecaptcha]');
+                            if (parent) return {x: r.x, y: r.y, w: r.width, h: r.height, type: 'parent-iframe'};
+                        }
+                    }
+                    return null;
                 })()
             """)
             if not widget_info or not isinstance(widget_info, dict):
-                logger.debug("Turnstile iframe not found in DOM")
+                logger.debug("Turnstile widget not found in DOM")
                 return False
 
+            wtype = widget_info.get("type", "unknown")
             # Click the checkbox area (left side of the widget)
             cx = widget_info["x"] + min(widget_info["w"] * 0.15, 30)
             cy = widget_info["y"] + widget_info["h"] * 0.5
-            logger.debug("Turnstile iframe at (%.0f,%.0f) size %dx%d, clicking (%.0f,%.0f)",
-                         widget_info["x"], widget_info["y"],
-                         widget_info["w"], widget_info["h"], cx, cy)
+            logger.info("Turnstile %s at (%.0f,%.0f) size %dx%d, clicking (%.0f,%.0f)",
+                        wtype, widget_info["x"], widget_info["y"],
+                        widget_info["w"], widget_info["h"], cx, cy)
 
             if self.hc:
                 await self.hc._move_to(cx, cy)
@@ -672,14 +675,21 @@ class VFSBrowser:
             cf_debug = await self.page.evaluate("""
                 (() => {
                     const iframes = [...document.querySelectorAll('iframe')].map(
-                        f => ({src: f.src?.substring(0, 120), w: f.offsetWidth, h: f.offsetHeight}));
-                    const cfs = [...document.querySelectorAll(
+                        f => ({src: f.src?.substring(0, 120), w: f.offsetWidth, h: f.offsetHeight,
+                               cw: f.clientWidth, ch: f.clientHeight}));
+                    const containers = document.querySelectorAll(
                         '.cf-turnstile, [appcloudflarerecaptcha], app-cloudflare-captcha-container, [data-sitekey]'
-                    )].map(e => e.tagName + (e.className ? '.' + e.className : ''));
-                    return JSON.stringify({iframes: iframes.slice(0, 5), cf_els: cfs.slice(0, 5)});
+                    );
+                    const cfs = [...containers].map(e => {
+                        const r = e.getBoundingClientRect();
+                        const children = [...e.children].map(c => c.tagName + '.' + c.className).slice(0, 5);
+                        return {tag: e.tagName, cls: e.className, w: Math.round(r.width), h: Math.round(r.height),
+                                children: children, innerHTML: e.innerHTML?.substring(0, 200)};
+                    });
+                    return JSON.stringify({iframes: iframes.slice(0, 5), containers: cfs.slice(0, 3)});
                 })()
             """)
-            logger.error("sitekey не найден — CF elements: %s", cf_debug)
+            logger.error("sitekey не найден — CF debug: %s", cf_debug)
             await self._screenshot("no_sitekey")
             return False
 
@@ -1037,6 +1047,7 @@ class VFSBrowser:
             logger.warning("Warming failed, прямой заход")
             await self.page.get(Config.VFS_URL)
         await self._delay(3, 5)
+        await self._screenshot("after_warming")
 
         # Check for proxy/network failure after warming
         url = await self._url()
@@ -1063,17 +1074,27 @@ class VFSBrowser:
         for attempt in range(4):
             state = await self._page_state()
             logger.info("State: %s (attempt %d)", state, attempt + 1)
+            await self._screenshot(f"step_{attempt+1}_{state}")
 
             if state == "unknown" and attempt == 0:
                 url = await self._url()
                 text = await self._text()
                 logger.info("DEBUG unknown — URL: %s", url[:200])
                 logger.info("DEBUG unknown — text: %s", text[:300])
-                await self._screenshot("state_unknown")
 
             if state == "blocked":
-                await self._screenshot("blocked")
                 return False
+
+            if state == "session_expired":
+                logger.warning("Session expired — удаляю куки и перезахожу")
+                try:
+                    if os.path.exists(self._cookies_path):
+                        os.remove(self._cookies_path)
+                except OSError:
+                    pass
+                await self.page.get(Config.VFS_URL)
+                await self._delay(3, 5)
+                continue
 
             if state == "cloudflare":
                 if not await self._wait_cloudflare():
@@ -1179,6 +1200,7 @@ class VFSBrowser:
                         await pwd_el.send_keys("\r")
 
                 await self._delay(4, 8)
+                await self._screenshot("after_signin_click")
                 state = await self._page_state()
 
                 if state == "login":
@@ -1203,9 +1225,16 @@ class VFSBrowser:
                 if final_state != "unknown":
                     break
 
-        if final_state in ("login", "cloudflare", "captcha", "blocked"):
+        if final_state in ("login", "cloudflare", "captcha", "blocked", "session_expired"):
             logger.error("Логин не удался (final_state=%s)", final_state)
             await self._screenshot("login_failed")
+            if final_state == "session_expired":
+                try:
+                    if os.path.exists(self._cookies_path):
+                        os.remove(self._cookies_path)
+                        logger.info("Stale cookies deleted")
+                except OSError:
+                    pass
             return False
 
         self.logged_in = True
@@ -1287,6 +1316,7 @@ class VFSBrowser:
             return False, "Кнопка 'Start New Booking' не найдена", None
 
         await self._delay(2, 4)
+        await self._screenshot("after_start_new_booking")
 
         # Обработка возможных препятствий после клика
         if not await self._handle_obstacle():
@@ -1309,6 +1339,8 @@ class VFSBrowser:
             if "choose your" not in text:
                 return False, f"Неожиданная страница: {text[:200]}", None
 
+        await self._screenshot("appointment_form_loaded")
+
         # Шаг 4: Выбираем Centre (formcontrolname="centerCode")
         if self.hc:
             await self.hc.micro_scroll()
@@ -1316,6 +1348,7 @@ class VFSBrowser:
             return False, "Не удалось выбрать Centre", None
 
         await self._delay(1.5, 3.0)
+        await self._screenshot("after_centre_select")
 
         # Шаг 5: Выбираем Category (formcontrolname="selectedSubvisaCategory")
         if self.hc:
@@ -1324,6 +1357,7 @@ class VFSBrowser:
             return False, "Не удалось выбрать Category", None
 
         await self._delay(1.5, 3.0)
+        await self._screenshot("after_category_select")
 
         # Шаг 6: Выбираем Sub-category (formcontrolname="visaCategoryCode")
         if self.hc:
@@ -1332,6 +1366,7 @@ class VFSBrowser:
             return False, f"Не удалось выбрать Sub-category: {subcategory}", None
 
         await self._delay(2.0, 4.0)
+        await self._screenshot("after_subcategory_select")
 
         # Шаг 7: Читаем результат — двойная проверка (API + DOM)
         # Сначала проверяем перехваченные API-ответы
@@ -1433,7 +1468,20 @@ class VFSBrowser:
         state = await self._page_state()
 
         if state == "dashboard":
+            await self._screenshot("on_dashboard")
             return True
+
+        if state == "session_expired":
+            logger.warning("Session expired on dashboard — re-login")
+            try:
+                if os.path.exists(self._cookies_path):
+                    os.remove(self._cookies_path)
+            except OSError:
+                pass
+            self.logged_in = False
+            if not await self.login():
+                return False
+            return await self._ensure_dashboard(depth + 1)
 
         if state in ("appointment_form",):
             await self.page.get(f"{self.VFS_BASE}/dashboard")

@@ -83,6 +83,7 @@ from logging.handlers import RotatingFileHandler
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,
     handlers=[
         logging.StreamHandler(),
         RotatingFileHandler("vfs_monitor.log", maxBytes=10*1024*1024, backupCount=3, encoding="utf-8"),
