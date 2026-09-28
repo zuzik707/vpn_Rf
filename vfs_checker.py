@@ -1,3 +1,25 @@
+"""
+VFS Global Slot Checker — точно под visa.vfsglobal.com/uzb/en/lva
+
+Реальный флоу сайта (из скриншотов):
+1. Login page → вводим email/password → Cloudflare/Turnstile
+2. Dashboard → "Active application(s)" + кнопка "Start New Booking"
+3. Click "Start New Booking" → Appointment Details (Step 1)
+4. Dropdown "Choose your Application Centre" → "VFS GLOBAL SERVICES UBKN"
+5. Dropdown "Choose your appointment category" → "Latvia Long Stay/Visa D"
+6. Dropdown "Choose your sub-category" → "Work (Visa D) Uzbek, Turkmen"
+   или "Cargo Drivers (Visa D) Uzbek, Turkmen"
+7. Если слотов нет → голубой банер:
+   "We are sorry but no appointment slots are currently available.
+    New slots open at regular intervals, please try again later"
+   Кнопка "Continue" — disabled/greyed out
+8. Если слоты ЕСТЬ → банера нет, "Continue" активна,
+   возможно показывает дату/время
+
+Наша задача: пройти шаги 1-6, проверить шаг 7 vs 8,
+если слоты — мгновенный Telegram push.
+"""
+
 import asyncio
 import logging
 import os
@@ -12,69 +34,31 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
-# Маркеры для определения состояния страницы
-NO_SLOTS_MARKERS = [
-    "no appointment",
-    "no available",
-    "currently no date",
-    "slot not available",
-    "no earlier date",
-    "not available",
-    "no open dates",
-    "there are no open",
-    "appointment is unavailable",
-]
+# Точный текст банера "нет слотов" с сайта VFS
+NO_SLOTS_TEXT = "we are sorry but no appointment slots are currently available"
 
-SLOTS_AVAILABLE_MARKERS = [
-    "earliest available",
-    "available slot",
-    "select date",
-    "choose a date",
-    "appointment date",
-    "book appointment",
-    "available date",
-    "open appointment",
-    "select time",
-    "choose time",
-]
-
-CAPTCHA_MARKERS = [
-    "cf-turnstile",
-    "turnstile-wrapper",
-    "cf-challenge",
-    "hcaptcha",
-    "h-captcha",
-    "g-recaptcha",
-    "captcha-container",
-]
-
+# Маркеры
 CLOUDFLARE_MARKERS = [
     "checking your browser",
     "just a moment",
     "cf-browser-verification",
     "challenge-platform",
     "verifying you are human",
-    "please wait",
-    "ray id",
 ]
-
+CAPTCHA_MARKERS = [
+    "cf-turnstile",
+    "turnstile-wrapper",
+    "challenges.cloudflare.com",
+    "hcaptcha",
+    "g-recaptcha",
+]
 BLOCKED_MARKERS = [
     "access denied",
-    "forbidden",
-    "blocked",
-    "temporarily unavailable",
     "too many requests",
     "rate limit",
-    "try again later",
     "account has been",
     "suspended",
-]
-
-LOGIN_MARKERS = [
-    "sign in",
-    "log in",
-    "email address",
-    "email id",
+    "temporarily blocked",
 ]
 
 
@@ -84,22 +68,21 @@ class VFSBrowser:
         self.page: uc.Tab | None = None
         self.captcha_solver = CaptchaSolver()
         self.logged_in = False
+        self.on_dashboard = False
         self.last_login_time: float = 0
-        self._recursion_depth = 0
+
+    # ── Browser lifecycle ──────────────────────────────────────────
 
     async def start_browser(self) -> None:
         os.makedirs(Config.BROWSER_DATA_DIR, exist_ok=True)
         os.makedirs(Config.SCREENSHOT_DIR, exist_ok=True)
-
-        chrome_args = get_chrome_args()
-
         self.browser = await uc.start(
             user_data_dir=Config.BROWSER_DATA_DIR,
             headless=False,
             lang="en-US",
-            browser_args=chrome_args,
+            browser_args=get_chrome_args(),
         )
-        logger.info("Браузер запущен (nodriver + stealth args)")
+        logger.info("Chrome запущен (nodriver)")
 
     async def close_browser(self) -> None:
         if self.browser:
@@ -107,449 +90,595 @@ class VFSBrowser:
                 self.browser.stop()
             except Exception:
                 pass
-            self.browser = None
-            self.page = None
-            self.logged_in = False
-            logger.info("Браузер закрыт")
+        self.browser = None
+        self.page = None
+        self.logged_in = False
+        self.on_dashboard = False
 
-    async def _human_delay(self, min_s: float = 0.5, max_s: float = 2.0) -> None:
-        await asyncio.sleep(random.uniform(min_s, max_s))
+    # ── Human-like helpers ─────────────────────────────────────────
+
+    async def _delay(self, lo: float = 0.5, hi: float = 2.0) -> None:
+        await asyncio.sleep(random.uniform(lo, hi))
 
     async def _human_type(self, element, text: str) -> None:
-        """Печатаем как человек — с рандомной скоростью и паузами."""
         await element.clear_input()
-        await self._human_delay(0.2, 0.5)
-        for i, char in enumerate(text):
+        await self._delay(0.2, 0.4)
+        for char in text:
             await element.send_keys(char)
-            # Микро-пауза между символами
-            base_delay = random.uniform(0.04, 0.12)
-            # Иногда "задумываемся" подольше
-            if random.random() < 0.08:
-                base_delay += random.uniform(0.2, 0.5)
-            # После @ или . в email — чуть длиннее
+            d = random.uniform(0.04, 0.12)
+            if random.random() < 0.07:
+                d += random.uniform(0.2, 0.5)
             if char in ("@", "."):
-                base_delay += random.uniform(0.1, 0.3)
-            await asyncio.sleep(base_delay)
+                d += random.uniform(0.1, 0.3)
+            await asyncio.sleep(d)
 
-    async def _get_page_text(self) -> str:
+    # ── Page inspection ────────────────────────────────────────────
+
+    async def _text(self) -> str:
         try:
             return ((await self.page.evaluate("document.body.innerText")) or "").lower()
         except Exception:
             return ""
 
-    async def _get_page_html(self) -> str:
+    async def _html(self) -> str:
         try:
             return ((await self.page.evaluate("document.documentElement.outerHTML")) or "").lower()
         except Exception:
             return ""
 
-    async def _take_screenshot(self, name: str) -> str:
-        path = os.path.join(Config.SCREENSHOT_DIR, f"{name}_{int(time.time())}.png")
+    async def _screenshot(self, tag: str) -> str:
+        path = os.path.join(Config.SCREENSHOT_DIR, f"{tag}_{int(time.time())}.png")
         try:
             await self.page.save_screenshot(path)
-        except Exception as e:
-            logger.debug("Скриншот не удался: %s", e)
+        except Exception:
+            pass
         return path
 
-    async def _detect_page_state(self) -> str:
-        html = await self._get_page_html()
-        text = await self._get_page_text()
-        combined = html + " " + text
+    async def _page_state(self) -> str:
+        """Определяем где мы находимся."""
+        html = await self._html()
+        text = await self._text()
+        both = html + " " + text
 
-        if any(m in combined for m in BLOCKED_MARKERS):
+        if any(m in both for m in BLOCKED_MARKERS):
             return "blocked"
-        if any(m in combined for m in CLOUDFLARE_MARKERS):
+        if any(m in both for m in CLOUDFLARE_MARKERS):
             return "cloudflare"
-        if any(m in combined for m in CAPTCHA_MARKERS):
-            if any(m in combined for m in LOGIN_MARKERS):
-                return "login_with_captcha"
+        if any(m in both for m in CAPTCHA_MARKERS):
             return "captcha"
-        if any(m in combined for m in SLOTS_AVAILABLE_MARKERS):
-            return "slots_found"
-        if any(m in combined for m in NO_SLOTS_MARKERS):
-            return "no_slots"
-        if any(m in combined for m in LOGIN_MARKERS) and "password" in combined:
-            return "login_page"
+
+        # Dashboard — после логина
+        if "start new booking" in both:
+            return "dashboard"
+        # Appointment Details form — Step 1
+        if "appointment details" in both and "choose your" in both:
+            return "appointment_form"
+        # Login page
+        if ("sign in" in both or "log in" in both) and "password" in both:
+            return "login"
+        # Sign out link = мы залогинены
+        if "sign out" in both or "my account" in both:
+            return "logged_in"
+
         return "unknown"
 
-    async def _wait_for_cloudflare(self, timeout: int = 60) -> bool:
-        """
-        Ждём пока nodriver пройдёт Cloudflare challenge.
-        nodriver проходит его автоматически благодаря anti-detect,
-        но нужно дать время.
-        """
-        logger.info("Cloudflare challenge — ждём (до %d сек)...", timeout)
-        start = time.time()
-        while time.time() - start < timeout:
+    # ── Cloudflare / CAPTCHA ───────────────────────────────────────
+
+    async def _wait_cloudflare(self, timeout: int = 90) -> bool:
+        logger.info("Cloudflare challenge — ждём до %dс...", timeout)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
             await asyncio.sleep(3)
-            state = await self._detect_page_state()
-            if state not in ("cloudflare",):
-                logger.info("Cloudflare пройден -> %s (%.0f сек)", state, time.time() - start)
+            if await self._page_state() != "cloudflare":
+                logger.info("Cloudflare пройден (%.0fс)", time.time() - t0)
                 return True
-        logger.error("Cloudflare НЕ пройден за %d сек", timeout)
-        await self._take_screenshot("cf_timeout")
+        logger.error("Cloudflare timeout")
+        await self._screenshot("cf_fail")
         return False
 
-    async def _extract_turnstile_sitekey(self) -> str | None:
-        """Извлекаем sitekey Turnstile несколькими способами."""
-        sitekey = await self.page.evaluate("""
+    async def _extract_sitekey(self) -> str | None:
+        return await self.page.evaluate("""
             (() => {
-                // Способ 1: data-sitekey атрибут
                 let el = document.querySelector('[data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
-
-                // Способ 2: cf-turnstile div
                 el = document.querySelector('.cf-turnstile[data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
-
-                // Способ 3: iframe URL
                 const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
                 if (iframe) {
                     const m = iframe.src.match(/[?&]k=([^&]+)/);
                     if (m) return m[1];
                 }
-
-                // Способ 4: inline script с sitekey
-                const scripts = document.querySelectorAll('script');
-                for (const s of scripts) {
+                for (const s of document.querySelectorAll('script')) {
                     if (!s.textContent) continue;
-                    // turnstile.render({sitekey: '...'})
-                    let m = s.textContent.match(/sitekey['":\\s]+['"]([0-9a-zA-Z_-]{20,})['"]/);
-                    if (m) return m[1];
-                    // data-sitekey="..."
-                    m = s.textContent.match(/data-sitekey=['"]([^'"]+)['"]/);
+                    const m = s.textContent.match(/sitekey['"]?\\s*[:=]\\s*['"]([0-9a-zA-Z_-]{20,})['"]/);
                     if (m) return m[1];
                 }
-
-                // Способ 5: meta tag
-                el = document.querySelector('meta[name="cf-turnstile-sitekey"]');
-                if (el) return el.getAttribute('content');
-
                 return null;
             })()
         """)
-        return sitekey
 
-    async def _solve_and_inject_turnstile(self) -> bool:
-        """Решаем Turnstile через 2Captcha и инжектим токен."""
-        sitekey = await self._extract_turnstile_sitekey()
+    async def _solve_turnstile(self) -> bool:
+        sitekey = await self._extract_sitekey()
         if not sitekey:
-            logger.error("Turnstile sitekey не найден")
-            await self._take_screenshot("no_sitekey")
+            logger.error("sitekey не найден")
+            await self._screenshot("no_sitekey")
             return False
 
         page_url = await self.page.evaluate("window.location.href")
-        logger.info("Решаю Turnstile (sitekey=%s...)", sitekey[:16])
-
+        logger.info("2Captcha: решаю Turnstile (sitekey=%s...)", sitekey[:16])
         token = self.captcha_solver.solve_turnstile(sitekey, page_url)
         if not token:
-            logger.error("2Captcha не вернул токен")
             return False
 
-        # Инжектим токен
-        # Важно: экранируем кавычки в токене
-        safe_token = token.replace("'", "\\'").replace('"', '\\"')
-        result = await self.page.evaluate(f"""
+        safe = token.replace("\\", "\\\\").replace("'", "\\'")
+        await self.page.evaluate(f"""
             (() => {{
-                let ok = false;
-
-                // 1. Стандартные input поля
-                for (const name of ['cf-turnstile-response', 'g-recaptcha-response']) {{
-                    const el = document.querySelector('[name="' + name + '"]')
-                             || document.getElementById(name);
+                for (const n of ['cf-turnstile-response','g-recaptcha-response']) {{
+                    const el = document.querySelector('[name="'+n+'"]') || document.getElementById(n);
                     if (el) {{
-                        el.value = '{safe_token}';
-                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                        ok = true;
+                        el.value = '{safe}';
+                        el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles:true}}));
                     }}
                 }}
-
-                // 2. Callback функции
-                const callbacks = [
-                    'tsCallback', 'turnstileCallback',
-                    'onTurnstileSuccess', 'cfCallback',
-                    'captchaCallback', 'onCaptchaSuccess',
-                ];
-                for (const cb of callbacks) {{
-                    if (typeof window[cb] === 'function') {{
-                        try {{
-                            window[cb]('{safe_token}');
-                            ok = true;
-                        }} catch(e) {{}}
-                    }}
+                for (const cb of ['tsCallback','turnstileCallback','onTurnstileSuccess','cfCallback','captchaCallback']) {{
+                    if (typeof window[cb]==='function') try {{ window[cb]('{safe}'); }} catch(e) {{}}
                 }}
+                const widgets = document.querySelectorAll('.cf-turnstile[data-callback]');
+                widgets.forEach(w => {{
+                    const fn = window[w.getAttribute('data-callback')];
+                    if (typeof fn==='function') try {{ fn('{safe}'); }} catch(e) {{}}
+                }});
+            }})()
+        """)
+        logger.info("Turnstile token инжектирован")
+        await self._delay(1.5, 3.0)
+        return True
 
-                // 3. Через turnstile API если доступен
-                if (window.turnstile) {{
-                    const widgets = document.querySelectorAll('.cf-turnstile');
-                    widgets.forEach(w => {{
-                        const cbName = w.getAttribute('data-callback');
-                        if (cbName && typeof window[cbName] === 'function') {{
-                            try {{
-                                window[cbName]('{safe_token}');
-                                ok = true;
-                            }} catch(e) {{}}
+    async def _handle_obstacle(self) -> bool:
+        """Обработка любого препятствия (CF/captcha/blocked)."""
+        state = await self._page_state()
+        if state == "blocked":
+            logger.error("BLOCKED!")
+            await self._screenshot("blocked")
+            return False
+        if state == "cloudflare":
+            if not await self._wait_cloudflare():
+                return False
+            await inject_stealth(self.page)
+            state = await self._page_state()
+        if state == "captcha":
+            if not await self._solve_turnstile():
+                return False
+            await self._delay(2, 4)
+        return True
+
+    # ── Select dropdown by visible text ────────────────────────────
+
+    async def _select_dropdown_option(self, dropdown_label: str, option_text: str) -> bool:
+        """
+        Находим dropdown по тексту label'а и выбираем option по тексту.
+        VFS использует обычные HTML <select> элементы.
+        """
+        logger.info("Выбираю '%s' в '%s'...", option_text, dropdown_label)
+
+        # Ищем select, связанный с label
+        selected = await self.page.evaluate(f"""
+            (() => {{
+                const optText = '{option_text.replace("'", "\\'")}';
+                const labelText = '{dropdown_label.replace("'", "\\'")}';
+
+                // Все select'ы на странице
+                const selects = document.querySelectorAll('select');
+                for (const sel of selects) {{
+                    // Проверяем label
+                    let labelEl = null;
+                    if (sel.id) labelEl = document.querySelector('label[for="'+sel.id+'"]');
+                    if (!labelEl) labelEl = sel.closest('div,fieldset')?.querySelector('label');
+                    const lText = (labelEl?.textContent || '').toLowerCase();
+                    const sLabel = labelText.toLowerCase();
+
+                    // Ищем select, чей label содержит нужный текст
+                    if (!lText.includes(sLabel) && !sLabel.includes('centre') && !sLabel.includes('center')) {{
+                        // Также проверяем по предшествующему тексту
+                        const prev = sel.previousElementSibling;
+                        const prevText = (prev?.textContent || '').toLowerCase();
+                        if (!prevText.includes(sLabel)) continue;
+                    }}
+
+                    // Ищем option с нужным текстом
+                    for (const opt of sel.options) {{
+                        if (opt.text.toLowerCase().includes(optText.toLowerCase())) {{
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            sel.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            return true;
                         }}
-                    }});
+                    }}
                 }}
 
-                return ok;
+                // Fallback: ищем по всем select'ам на странице
+                for (const sel of selects) {{
+                    for (const opt of sel.options) {{
+                        if (opt.text.toLowerCase().includes(optText.toLowerCase())) {{
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            sel.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            return true;
+                        }}
+                    }}
+                }}
+
+                return false;
             }})()
         """)
 
-        if result:
-            logger.info("Turnstile token инжектирован и callback вызван")
-        else:
-            logger.warning("Token инжектирован, но callbacks не найдены — продолжаем")
+        if selected:
+            logger.info("Выбрано: '%s'", option_text)
+            await self._delay(1.0, 2.5)
+            return True
 
-        await self._human_delay(1.5, 3.0)
-        return True
+        # Fallback: может это Angular Material dropdown (mat-select)
+        logger.info("HTML <select> не сработал — пробую Angular mat-select...")
+        clicked = await self._try_mat_select(dropdown_label, option_text)
+        if clicked:
+            await self._delay(1.0, 2.5)
+            return True
 
-    async def _find_and_click(self, selectors: list[str]):
-        """Ищем элемент по списку селекторов и кликаем."""
-        for sel in selectors:
-            try:
-                el = await self.page.query_selector(sel)
-                if el:
-                    await el.click()
-                    return True
-            except Exception:
-                continue
+        logger.warning("Не удалось выбрать '%s'", option_text)
+        await self._screenshot(f"dropdown_fail_{dropdown_label[:10]}")
         return False
 
+    async def _try_mat_select(self, label_text: str, option_text: str) -> bool:
+        """Для Angular Material dropdowns (mat-select)."""
+        return await self.page.evaluate(f"""
+            (() => {{
+                const label = '{label_text.replace("'", "\\'")}';
+                const option = '{option_text.replace("'", "\\'")}';
+
+                // Ищем mat-select или div[role=listbox] рядом с label
+                const all = document.querySelectorAll('mat-select, [role="combobox"], .dropdown-toggle, select');
+                for (const el of all) {{
+                    // Кликаем чтобы открыть
+                    el.click();
+                }}
+
+                // Ждём появления option list
+                return new Promise(resolve => {{
+                    setTimeout(() => {{
+                        const opts = document.querySelectorAll(
+                            'mat-option, [role="option"], .dropdown-item, li.option'
+                        );
+                        for (const o of opts) {{
+                            if (o.textContent.toLowerCase().includes(option.toLowerCase())) {{
+                                o.click();
+                                resolve(true);
+                                return;
+                            }}
+                        }}
+                        resolve(false);
+                    }}, 500);
+                }});
+            }})()
+        """)
+
+    # ── Login flow ─────────────────────────────────────────────────
+
+    async def login(self) -> bool:
+        if not self.browser:
+            await self.start_browser()
+
+        self.page = await self.browser.get("about:blank")
+        await setup_stealth_on_new_page(self.page)
+        await self._delay(0.5, 1.0)
+
+        logger.info("Открываю %s", Config.VFS_URL)
+        await self.page.get(Config.VFS_URL)
+        await self._delay(3, 5)
+        await inject_stealth(self.page)
+
+        for attempt in range(4):
+            state = await self._page_state()
+            logger.info("State: %s (attempt %d)", state, attempt + 1)
+
+            if state == "blocked":
+                await self._screenshot("blocked")
+                return False
+
+            if state == "cloudflare":
+                if not await self._wait_cloudflare():
+                    return False
+                await inject_stealth(self.page)
+                continue
+
+            if state == "captcha":
+                if not await self._solve_turnstile():
+                    return False
+                await self._delay(2, 4)
+                continue
+
+            if state == "login":
+                # Заполняем форму
+                email_el = await self._find_input([
+                    "input[type='email']", "input[name='email']", "input[id='email']",
+                    "input[name='username']", "input[id='username']",
+                    "input[placeholder*='mail']", "input[autocomplete='email']",
+                ])
+                if not email_el:
+                    await self._screenshot("no_email")
+                    return False
+
+                await email_el.click()
+                await self._delay(0.3, 0.6)
+                await self._human_type(email_el, Config.VFS_EMAIL)
+                await self._delay(0.6, 1.2)
+
+                pwd_el = await self._find_input([
+                    "input[type='password']", "input[name='password']", "input[id='password']",
+                ])
+                if not pwd_el:
+                    await self._screenshot("no_pwd")
+                    return False
+
+                await pwd_el.click()
+                await self._delay(0.3, 0.6)
+                await self._human_type(pwd_el, Config.VFS_PASSWORD)
+                await self._delay(0.6, 1.2)
+
+                # Может быть captcha на форме логина
+                html = await self._html()
+                if any(m in html for m in CAPTCHA_MARKERS):
+                    logger.info("CAPTCHA на форме логина")
+                    await self._solve_turnstile()
+                    await self._delay(1, 2)
+
+                # Submit
+                if not await self._click([
+                    "button[type='submit']", "input[type='submit']",
+                    "button.btn-primary", "button.mat-raised-button",
+                ]):
+                    await pwd_el.send_keys("\r")
+
+                await self._delay(4, 8)
+                state = await self._page_state()
+
+                if state == "login":
+                    text = await self._text()
+                    if any(w in text for w in ["incorrect", "invalid", "wrong", "failed"]):
+                        logger.error("Неверный логин/пароль!")
+                        return False
+                    continue
+
+                if state in ("cloudflare", "captcha"):
+                    continue
+
+            if state in ("dashboard", "logged_in", "appointment_form", "unknown"):
+                break
+
+        self.logged_in = True
+        self.on_dashboard = (await self._page_state()) == "dashboard"
+        self.last_login_time = time.time()
+        logger.info("Login OK (state=%s)", await self._page_state())
+        return True
+
+    # ── Core: check slots ──────────────────────────────────────────
+
+    async def check_slots(self) -> tuple[bool, str, str | None]:
+        """
+        Полный флоу проверки слотов:
+        Dashboard → Start New Booking → выбираем dropdown'ы → читаем результат.
+        Проверяем ОБЕ подкатегории.
+        """
+        if not self.browser or not self.logged_in:
+            if not await self.login():
+                return False, "Логин не удался", None
+
+        results = []
+        for subcategory in Config.VFS_SUBCATEGORIES:
+            found, info, screenshot = await self._check_single_subcategory(subcategory)
+            if found:
+                return True, f"[{subcategory}]\n{info}", screenshot
+            results.append(f"{subcategory}: {info}")
+
+        return False, " | ".join(results), None
+
+    async def _check_single_subcategory(self, subcategory: str) -> tuple[bool, str, str | None]:
+        """Проверяем конкретную подкатегорию."""
+        logger.info("Проверяю: %s", subcategory)
+
+        # Шаг 1: Убеждаемся что мы на dashboard
+        if not await self._ensure_dashboard():
+            return False, "Не удалось попасть на dashboard", None
+
+        # Шаг 2: Кликаем "Start New Booking"
+        await self._delay(1, 2)
+        clicked = await self._click([
+            "button:has-text('Start New Booking')",
+            "a:has-text('Start New Booking')",
+        ])
+        if not clicked:
+            # Fallback: ищем кнопку по тексту через JS
+            clicked = await self.page.evaluate("""
+                (() => {
+                    const els = document.querySelectorAll('button, a, input[type="button"]');
+                    for (const el of els) {
+                        if (el.textContent.toLowerCase().includes('start new booking')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+            """)
+        if not clicked:
+            await self._screenshot("no_start_booking")
+            return False, "Кнопка 'Start New Booking' не найдена", None
+
+        await self._delay(2, 4)
+
+        # Обработка возможных препятствий после клика
+        if not await self._handle_obstacle():
+            return False, "Препятствие после Start New Booking", None
+
+        # Шаг 3: Ждём загрузки формы Appointment Details
+        state = await self._page_state()
+        if state != "appointment_form":
+            await self._delay(2, 3)
+            state = await self._page_state()
+
+        if state != "appointment_form":
+            logger.warning("Не на форме appointment (state=%s)", state)
+            if state == "login":
+                self.logged_in = False
+                return False, "Сессия истекла", None
+            await self._screenshot("not_appt_form")
+            # Попробуем всё равно продолжить
+            text = await self._text()
+            if "choose your" not in text:
+                return False, f"Неожиданная страница: {text[:200]}", None
+
+        # Шаг 4: Выбираем Centre
+        if not await self._select_dropdown_option("Application Centre", Config.VFS_CENTRE):
+            return False, "Не удалось выбрать Centre", None
+
+        await self._delay(1.5, 3.0)
+
+        # Шаг 5: Выбираем Category
+        if not await self._select_dropdown_option("appointment category", Config.VFS_CATEGORY):
+            return False, "Не удалось выбрать Category", None
+
+        await self._delay(1.5, 3.0)
+
+        # Шаг 6: Выбираем Sub-category
+        if not await self._select_dropdown_option("sub-category", subcategory):
+            return False, f"Не удалось выбрать Sub-category: {subcategory}", None
+
+        await self._delay(2.0, 4.0)
+
+        # Шаг 7: Читаем результат
+        text = await self._text()
+        html = await self._html()
+
+        # Проверяем банер "нет слотов"
+        if NO_SLOTS_TEXT in text:
+            logger.info("Нет слотов для '%s'", subcategory)
+            return False, "Нет слотов", None
+
+        # Проверяем активность кнопки Continue
+        continue_disabled = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button, input[type="submit"]');
+                for (const b of btns) {
+                    if (b.textContent.toLowerCase().includes('continue')) {
+                        return b.disabled || b.classList.contains('disabled') ||
+                               b.getAttribute('aria-disabled') === 'true';
+                    }
+                }
+                return null;
+            })()
+        """)
+
+        if continue_disabled is False:
+            # Continue АКТИВНА = слоты ЕСТЬ!
+            screenshot = await self._screenshot("slots_found")
+            logger.info("СЛОТЫ НАЙДЕНЫ для '%s'!", subcategory)
+
+            # Пытаемся вытащить дату/время если видно
+            date_info = await self.page.evaluate("""
+                (() => {
+                    const text = document.body.innerText;
+                    const lines = text.split('\\n').filter(l => l.trim());
+                    const dateLines = lines.filter(l => {
+                        const low = l.toLowerCase();
+                        return low.includes('date') || low.includes('time') ||
+                               low.includes('slot') || low.includes('available') ||
+                               /\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}/.test(l) ||
+                               /\\d{1,2}\\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(l);
+                    });
+                    return dateLines.slice(0, 10).join('\\n');
+                })()
+            """)
+
+            info = date_info if date_info else "Слоты доступны — кнопка Continue активна!"
+            return True, info, screenshot
+
+        if continue_disabled is True:
+            # Continue ЗАБЛОКИРОВАНА но банера нет — странно, но нет слотов
+            logger.info("Continue disabled, банера нет — нет слотов для '%s'", subcategory)
+            return False, "Continue disabled", None
+
+        # Continue не найдена — проверяем текст
+        if "no appointment" in text or "sorry" in text:
+            return False, "Нет слотов (текст)", None
+
+        # Неясно — скриншот для анализа
+        screenshot = await self._screenshot("unclear")
+        return False, f"Неясный результат: {text[:200]}", screenshot
+
+    async def _ensure_dashboard(self) -> bool:
+        """Убеждаемся что мы на dashboard с кнопкой Start New Booking."""
+        state = await self._page_state()
+
+        if state == "dashboard":
+            return True
+
+        if state in ("appointment_form",):
+            # Уже на форме — идём назад на dashboard
+            base = Config.VFS_URL.replace("/login", "")
+            await self.page.get(f"{base}/dashboard")
+            await self._delay(2, 4)
+            if not await self._handle_obstacle():
+                return False
+            return (await self._page_state()) == "dashboard"
+
+        if state == "login":
+            self.logged_in = False
+            if not await self.login():
+                return False
+            return await self._ensure_dashboard()
+
+        if state in ("cloudflare", "captcha"):
+            if not await self._handle_obstacle():
+                return False
+            return await self._ensure_dashboard()
+
+        # logged_in или unknown — пробуем перейти на dashboard
+        base = Config.VFS_URL.replace("/login", "")
+        await self.page.get(f"{base}/dashboard")
+        await self._delay(2, 4)
+        if not await self._handle_obstacle():
+            return False
+        state = await self._page_state()
+        if state == "dashboard":
+            return True
+
+        # Последняя попытка
+        logger.warning("Не могу попасть на dashboard (state=%s)", state)
+        await self._screenshot("no_dashboard")
+        return False
+
+    # ── Utility ────────────────────────────────────────────────────
+
     async def _find_input(self, selectors: list[str]):
-        """Ищем input по списку селекторов."""
-        for sel in selectors:
+        for s in selectors:
             try:
-                el = await self.page.query_selector(sel)
+                el = await self.page.query_selector(s)
                 if el:
                     return el
             except Exception:
                 continue
         return None
 
-    async def _do_login(self) -> bool:
-        """Заполняем форму логина."""
-        logger.info("Заполняю форму логина...")
-        await self._human_delay(1.5, 3.0)
-
-        email_field = await self._find_input([
-            "input[type='email']",
-            "input[name='email']",
-            "input[id='email']",
-            "input[name='username']",
-            "input[id='username']",
-            "input[placeholder*='mail']",
-            "input[placeholder*='Email']",
-            "input[autocomplete='email']",
-            "input[autocomplete='username']",
-        ])
-        if not email_field:
-            logger.error("Поле email не найдено")
-            await self._take_screenshot("no_email")
-            return False
-
-        await email_field.click()
-        await self._human_delay(0.3, 0.7)
-        await self._human_type(email_field, Config.VFS_EMAIL)
-        await self._human_delay(0.8, 1.5)
-
-        password_field = await self._find_input([
-            "input[type='password']",
-            "input[name='password']",
-            "input[id='password']",
-        ])
-        if not password_field:
-            logger.error("Поле пароля не найдено")
-            await self._take_screenshot("no_password")
-            return False
-
-        await password_field.click()
-        await self._human_delay(0.3, 0.7)
-        await self._human_type(password_field, Config.VFS_PASSWORD)
-        await self._human_delay(0.8, 1.5)
-
-        # Сабмит
-        submitted = await self._find_and_click([
-            "button[type='submit']",
-            "input[type='submit']",
-            "button.mat-raised-button",
-            "button.btn-primary",
-            "button.login-btn",
-            "button.sign-in-btn",
-        ])
-        if not submitted:
-            logger.info("Submit кнопка не найдена — Enter")
-            await password_field.send_keys("\r")
-
-        logger.info("Логин отправлен — ждём ответ...")
-        await self._human_delay(4.0, 7.0)
-        return True
-
-    async def login(self) -> bool:
-        """Полный флоу логина: браузер -> cloudflare -> captcha -> логин."""
-        if not self.browser:
-            await self.start_browser()
-
-        self.page = await self.browser.get("about:blank")
-
-        # Инжектим stealth ПЕРЕД навигацией
-        await setup_stealth_on_new_page(self.page)
-        await self._human_delay(0.5, 1.0)
-
-        # Навигация на страницу логина
-        logger.info("Открываю %s", Config.VFS_URL)
-        await self.page.get(Config.VFS_URL)
-        await self._human_delay(3.0, 5.0)
-
-        # Post-navigation stealth inject
-        await inject_stealth(self.page)
-
-        for attempt in range(3):
-            state = await self._detect_page_state()
-            logger.info("Состояние страницы: %s (попытка %d)", state, attempt + 1)
-
-            if state == "blocked":
-                logger.error("Доступ заблокирован! Возможно IP бан.")
-                await self._take_screenshot("blocked")
-                return False
-
-            if state == "cloudflare":
-                if not await self._wait_for_cloudflare(timeout=90):
-                    return False
-                await inject_stealth(self.page)
+    async def _click(self, selectors: list[str]) -> bool:
+        for s in selectors:
+            try:
+                el = await self.page.query_selector(s)
+                if el:
+                    await el.click()
+                    return True
+            except Exception:
                 continue
-
-            if state in ("captcha", "login_with_captcha"):
-                # Если есть и логин форма и captcha — сначала заполняем форму
-                if state == "login_with_captcha":
-                    await self._do_login()
-                    await self._human_delay(1.0, 2.0)
-                    # Теперь решаем captcha
-                    if not await self._solve_and_inject_turnstile():
-                        return False
-                    await self._human_delay(2.0, 4.0)
-                    # И сабмитим ещё раз если нужно
-                    state = await self._detect_page_state()
-                    if state == "login_page":
-                        await self._find_and_click(["button[type='submit']"])
-                        await self._human_delay(4.0, 7.0)
-                else:
-                    if not await self._solve_and_inject_turnstile():
-                        return False
-                    await self._human_delay(2.0, 4.0)
-                continue
-
-            if state == "login_page":
-                if not await self._do_login():
-                    return False
-                # После отправки формы проверяем что дальше
-                state = await self._detect_page_state()
-                if state == "cloudflare":
-                    await self._wait_for_cloudflare()
-                    state = await self._detect_page_state()
-                if state == "captcha":
-                    if not await self._solve_and_inject_turnstile():
-                        return False
-                    await self._human_delay(3.0, 5.0)
-                    state = await self._detect_page_state()
-                if state == "login_page":
-                    text = await self._get_page_text()
-                    if "incorrect" in text or "invalid" in text or "wrong" in text:
-                        logger.error("Неверный логин/пароль!")
-                        return False
-                    logger.warning("Всё ещё на странице логина после попытки")
-                    await self._take_screenshot("still_login")
-                    continue
-                break
-
-            if state in ("slots_found", "no_slots", "unknown"):
-                logger.info("Уже залогинены! (state=%s)", state)
-                break
-
-        self.logged_in = True
-        self.last_login_time = time.time()
-        logger.info("Логин завершён успешно")
-        return True
-
-    async def check_slots(self) -> tuple[bool, str, str | None]:
-        """
-        Проверяем слоты.
-        Возвращает: (found, info_text, screenshot_path)
-        """
-        self._recursion_depth += 1
-        if self._recursion_depth > 3:
-            self._recursion_depth = 0
-            return False, "Слишком много редиректов", None
-
-        if not self.browser or not self.logged_in:
-            if not await self.login():
-                self._recursion_depth = 0
-                return False, "Логин не удался", None
-
-        # Переход на страницу бронирования
-        base = Config.VFS_URL.replace("/login", "")
-        appt_url = f"{base}/book-an-appointment"
-        logger.info("Проверяю слоты: %s", appt_url)
-
-        await self.page.get(appt_url)
-        await self._human_delay(3.0, 6.0)
-        await inject_stealth(self.page)
-
-        state = await self._detect_page_state()
-
-        if state == "blocked":
-            self._recursion_depth = 0
-            return False, "IP заблокирован", await self._take_screenshot("blocked")
-
-        if state == "cloudflare":
-            if await self._wait_for_cloudflare():
-                state = await self._detect_page_state()
-            else:
-                self._recursion_depth = 0
-                return False, "Cloudflare не пропустил", None
-
-        if state == "captcha":
-            await self._solve_and_inject_turnstile()
-            await self._human_delay(3.0, 5.0)
-            state = await self._detect_page_state()
-
-        if state == "login_page":
-            self.logged_in = False
-            self._recursion_depth = 0
-            return False, "Сессия истекла — перелогин на следующей итерации", None
-
-        if state == "slots_found":
-            screenshot = await self._take_screenshot("slots_found")
-            text = await self._get_page_text()
-
-            # Извлекаем информацию о слотах из текста
-            info_lines = []
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line or len(line) > 200:
-                    continue
-                low = line.lower()
-                if any(kw in low for kw in ["earliest", "available", "date", "slot", "appointment",
-                                             "january", "february", "march", "april", "may", "june",
-                                             "july", "august", "september", "october", "november", "december",
-                                             "2025", "2026", "2027"]):
-                    info_lines.append(line)
-
-            info = "\n".join(info_lines[:15]) if info_lines else "Слоты доступны!"
-            self._recursion_depth = 0
-            return True, info, screenshot
-
-        if state == "no_slots":
-            self._recursion_depth = 0
-            return False, "Слотов нет", None
-
-        # Неизвестное состояние — делаем скриншот для анализа
-        screenshot = await self._take_screenshot("unknown")
-        text = await self._get_page_text()
-        self._recursion_depth = 0
-        return False, f"Страница: {text[:300]}", screenshot
+        return False
 
     def session_alive(self) -> bool:
         if not self.logged_in:
