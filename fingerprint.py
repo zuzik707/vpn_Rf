@@ -87,6 +87,8 @@ def build_stealth_script(profile: dict) -> str:
     vendor = profile["webgl_vendor"]
     renderer = profile["webgl_renderer"]
 
+    w, h = vp
+
     return f"""
     // --- 1. webdriver cleanup (nodriver handles most, safety net) ---
     Object.defineProperty(navigator, 'webdriver', {{get: () => undefined, configurable: true}});
@@ -108,7 +110,11 @@ def build_stealth_script(profile: dict) -> str:
     Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => {hc}}});
     Object.defineProperty(navigator, 'deviceMemory', {{get: () => {dm}}});
 
-    // --- 4. chrome.runtime stub ---
+    // --- 4. navigator.languages (must match proxy geo, not VPS locale) ---
+    Object.defineProperty(navigator, 'languages', {{get: () => ['en-US', 'en', 'uz']}});
+    Object.defineProperty(navigator, 'language', {{get: () => 'en-US'}});
+
+    // --- 5. chrome.runtime stub ---
     if (!window.chrome) window.chrome = {{}};
     if (!window.chrome.runtime) {{
         window.chrome.runtime = {{
@@ -121,20 +127,38 @@ def build_stealth_script(profile: dict) -> str:
         }};
     }}
 
-    // --- 5. outerWidth/Height (headless = 0) ---
+    // --- 6. outerWidth/Height + screen dimensions (must match viewport) ---
     if (window.outerWidth === 0) {{
         Object.defineProperty(window, 'outerWidth', {{get: () => window.innerWidth + 16}});
     }}
     if (window.outerHeight === 0) {{
         Object.defineProperty(window, 'outerHeight', {{get: () => window.innerHeight + 88}});
     }}
+    Object.defineProperty(window.screen, 'width', {{get: () => {w}}});
+    Object.defineProperty(window.screen, 'height', {{get: () => {h}}});
+    Object.defineProperty(window.screen, 'availWidth', {{get: () => {w}}});
+    Object.defineProperty(window.screen, 'availHeight', {{get: () => {h} - 40}});
+    Object.defineProperty(window.screen, 'colorDepth', {{get: () => 24}});
 
-    // --- 6. connection rtt ---
+    // --- 7. connection rtt ---
     if (navigator.connection) {{
         Object.defineProperty(navigator.connection, 'rtt', {{get: () => {rtt}}});
     }}
 
-    // --- 7. CDP variable cleanup ---
+    // --- 8. WebRTC IP leak protection ---
+    const origRTC = window.RTCPeerConnection;
+    window.RTCPeerConnection = function(...args) {{
+        if (args[0] && args[0].iceServers) args[0].iceServers = [];
+        const pc = new origRTC(...args);
+        const origCreate = pc.createDataChannel.bind(pc);
+        return pc;
+    }};
+    window.RTCPeerConnection.prototype = origRTC.prototype;
+    if (window.webkitRTCPeerConnection) {{
+        window.webkitRTCPeerConnection = window.RTCPeerConnection;
+    }}
+
+    // --- 9. CDP variable cleanup ---
     (function() {{
         for (const p of Object.getOwnPropertyNames(window)) {{
             if (/^cdc_|^\\$cdc_/.test(p)) try {{ delete window[p]; }} catch(e) {{}}
@@ -144,13 +168,29 @@ def build_stealth_script(profile: dict) -> str:
         }}
     }})();
 
-    // --- 8. Canvas noise (stable per-profile seed) ---
+    // --- 10. Canvas noise (stable seed, covers getImageData + toDataURL) ---
+    const _seed = {seed};
+    function _addCanvasNoise(data) {{
+        for (let i = 0; i < data.length; i += 4) {{
+            if (((_seed + i) * 9301 + 49297) % 233280 < 2332) data[i] ^= 1;
+        }}
+    }}
     const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
     CanvasRenderingContext2D.prototype.getImageData = function(...args) {{
         const d = _origGetImageData.apply(this, args);
-        for (let i = 0; i < d.data.length; i += 4) {{
-            if ((({seed} + i) * 9301 + 49297) % 233280 < 2332) d.data[i] ^= 1;
-        }}
+        _addCanvasNoise(d.data);
         return d;
+    }};
+    const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(...args) {{
+        try {{
+            const ctx = this.getContext('2d');
+            if (ctx) {{
+                const d = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
+                _addCanvasNoise(d.data);
+                ctx.putImageData(d, 0, 0);
+            }}
+        }} catch(e) {{}}
+        return _origToDataURL.apply(this, args);
     }};
     """

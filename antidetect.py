@@ -47,4 +47,6 @@ def get_chrome_args() -> list[str]:
         "--no-default-browser-check",
         "--disable-popup-blocking",
         "--lang=en-US",
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+        "--enforce-webrtc-ip-permission-check",
     ]

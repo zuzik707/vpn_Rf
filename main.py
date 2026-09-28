@@ -304,7 +304,7 @@ async def run_monitor():
                     continue
 
             # Сохраняем статистику
-            save_session_state({
+            await asyncio.to_thread(save_session_state, {
                 "checks_total": stats.checks_total,
                 "slots_found_count": stats.slots_found_count,
                 "logins_total": stats.logins_total,

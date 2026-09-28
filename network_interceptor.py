@@ -40,6 +40,7 @@ class NetworkInterceptor:
 
     def __init__(self):
         self.captured: list[dict] = []
+        self._bodies: dict = {}
         self.last_slot_data: SlotData | None = None
         self._attached = False
         self._page = None
@@ -75,8 +76,16 @@ class NetworkInterceptor:
             })
             logger.info("API перехвачен: %s (status=%d)",
                         event.response.url[:120], event.response.status)
+            import asyncio
+            asyncio.ensure_future(self._fetch_body_now(event.request_id))
         except Exception as e:
             logger.debug("Response event error: %s", e)
+
+    async def _fetch_body_now(self, request_id) -> None:
+        """Fetch body immediately while it's still in Chrome buffer."""
+        body = await self.get_body(request_id)
+        if body is not None:
+            self._bodies[request_id] = body
 
     async def get_body(self, request_id) -> dict | None:
         if not self._page:
@@ -97,7 +106,8 @@ class NetworkInterceptor:
         slot_data = SlotData()
 
         for resp in reversed(self.captured):
-            body = await self.get_body(resp["request_id"])
+            rid = resp["request_id"]
+            body = self._bodies.get(rid) or await self.get_body(rid)
             if not body:
                 continue
 
@@ -148,6 +158,7 @@ class NetworkInterceptor:
 
     def clear(self) -> None:
         self.captured.clear()
+        self._bodies.clear()
         self.last_slot_data = None
 
     @property

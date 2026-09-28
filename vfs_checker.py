@@ -59,9 +59,9 @@ BLOCKED_MARKERS = [
     "access denied",
     "too many requests",
     "rate limit",
-    "account has been",
-    "suspended",
     "temporarily blocked",
+    "account has been suspended",
+    "account has been blocked",
 ]
 
 
@@ -689,6 +689,11 @@ class VFSBrowser:
         if not self.browser:
             await self.start_browser()
 
+        if self.page:
+            try:
+                await self.page.close()
+            except Exception:
+                pass
         self.page = await self.browser.get("about:blank")
         await setup_stealth_on_new_page(self.page)
         if self._proxy_auth:
