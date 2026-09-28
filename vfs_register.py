@@ -529,8 +529,7 @@ async def register_account(email: str = "", proxy_url: str = "",
     if not email:
         try:
             mail_client = TempMailClient()
-            prefix = f"vfs{int(time.time()) % 100000}"
-            created_email = mail_client.create_account(prefix)
+            created_email = mail_client.create_account()
             if progress_cb:
                 progress_cb(f"Email создан: <code>{created_email}</code>")
         except Exception as e:
