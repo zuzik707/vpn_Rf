@@ -213,12 +213,20 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
 
     try:
         stats.logins_total += 1
-        if not await checker.login():
+        login_ok = False
+        for login_attempt in range(3):
+            if await checker.login():
+                login_ok = True
+                logger.info("%s Логин OK", tag)
+                break
+            logger.warning("%s Логин не удался (попытка %d/3)", tag, login_attempt + 1)
+            await checker.close_browser()
+            if login_attempt < 2:
+                await asyncio.sleep(random.uniform(10, 20))
+        if not login_ok:
             stats.logins_failed += 1
-            logger.error("%s Первый логин не удался", tag)
-            await asyncio.to_thread(notify_error, f"{tag} Первый логин не удался. Проверь credentials.")
-        else:
-            logger.info("%s Логин OK", tag)
+            logger.error("%s Логин не удался после 3 попыток", tag)
+            await asyncio.to_thread(notify_error, f"{tag} Логин не удался после 3 попыток. Проверь proxy/credentials.")
 
         while running:
             if is_quiet_hours():

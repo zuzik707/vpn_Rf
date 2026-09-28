@@ -35,6 +35,17 @@ class SessionWarmer:
         self.page = page
         self.hc = human_clicker
 
+    async def _check_loaded(self) -> bool:
+        """Check page actually loaded (not chrome-error)."""
+        try:
+            url = await self.page.evaluate("window.location.href") or ""
+            if "chrome-error" in url:
+                logger.warning("Warming: page load failed — %s", url[:80])
+                return False
+            return True
+        except Exception:
+            return False
+
     async def warm(self) -> bool:
         """Пройти warming-маршрут до /login. True = дошли до логина."""
         try:
@@ -42,6 +53,9 @@ class SessionWarmer:
                 logger.info("Warming: %s → %s", step["label"], step["url"])
                 await asyncio.wait_for(self.page.get(step["url"]), timeout=60)
                 await asyncio.sleep(random.uniform(*step["wait"]))
+
+                if not await self._check_loaded():
+                    return False
 
                 if self.hc:
                     await self.hc.idle_drift(random.uniform(0.5, 1.5))
@@ -54,6 +68,9 @@ class SessionWarmer:
             logger.info("Warming: переход на login")
             await asyncio.wait_for(self.page.get(LOGIN_URL), timeout=60)
             await asyncio.sleep(random.uniform(1.5, 3.0))
+
+            if not await self._check_loaded():
+                return False
 
             if self.hc:
                 await self.hc.idle_drift(random.uniform(0.3, 0.8))
