@@ -351,7 +351,22 @@ class VFSBrowser:
             logger.info("Screenshot: %s", path)
         except Exception as e:
             logger.debug("Screenshot failed (%s): %s", tag, e)
+        self._cleanup_screenshots()
         return path
+
+    @staticmethod
+    def _cleanup_screenshots(max_files: int = 50) -> None:
+        """Keep only the latest screenshots to avoid filling disk."""
+        try:
+            sdir = Config.SCREENSHOT_DIR
+            files = sorted(
+                (os.path.join(sdir, f) for f in os.listdir(sdir) if f.endswith(".png")),
+                key=os.path.getmtime,
+            )
+            for old in files[:-max_files]:
+                os.remove(old)
+        except Exception:
+            pass
 
     async def _url(self) -> str:
         try:
