@@ -1,15 +1,14 @@
 """
 Human-like mouse/keyboard interaction через CDP Input events.
 
-Вместо голого element.click() — реалистичное поведение:
-- Bezier-кривая движения курсора от текущей позиции к цели
-- Hover 100-300ms перед кликом
-- Dwell time на dropdown'ах (человек читает список)
-- Микро-скроллы перед действиями
-- Idle drift — лёгкое движение курсора на "пустых" страницах
+- Bezier-кривая с distance-scaled control points
+- Acceleration-aware timing (slow→fast→slow)
+- Realistic idle drift (long pauses + micro-jitters)
+- Hover, dwell, micro-scroll
 """
 
 import asyncio
+import math
 import random
 
 import nodriver.cdp.input_ as inp
@@ -32,13 +31,11 @@ class HumanClicker:
         ty = box["y"] + random.uniform(box["h"] * 0.2, box["h"] * 0.8)
 
         await self._move_to(tx, ty)
-        # Hover
         await asyncio.sleep(random.uniform(0.1, 0.3))
         if dwell > 0:
             await asyncio.sleep(dwell)
-        # Click
         await self._mouse_down(tx, ty)
-        await asyncio.sleep(random.uniform(0.05, 0.12))
+        await asyncio.sleep(random.uniform(0.05, 0.15))
         await self._mouse_up(tx, ty)
         self.last_x, self.last_y = tx, ty
 
@@ -49,7 +46,7 @@ class HumanClicker:
         await self.click(option_el)
 
     async def scroll_into_view(self, element) -> None:
-        """Микро-скролл к элементу, как человек."""
+        """Микро-скролл к элементу."""
         try:
             await element.scroll_into_view()
         except Exception:
@@ -60,19 +57,33 @@ class HumanClicker:
         await asyncio.sleep(random.uniform(0.3, 0.7))
 
     async def idle_drift(self, duration: float = 1.0) -> None:
-        """Лёгкое движение курсора — имитация живого пользователя."""
+        """Realistic idle — long pauses with occasional micro-jitters."""
         t0 = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - t0 < duration:
-            dx = random.uniform(-30, 30)
-            dy = random.uniform(-20, 20)
-            nx = max(50, min(1200, self.last_x + dx))
-            ny = max(50, min(700, self.last_y + dy))
-            await self._dispatch_mouse("mouseMoved", nx, ny)
-            self.last_x, self.last_y = nx, ny
-            await asyncio.sleep(random.uniform(0.1, 0.4))
+            r = random.random()
+            if r < 0.6:
+                await asyncio.sleep(random.uniform(1.5, 4.0))
+            elif r < 0.85:
+                dx = random.gauss(0, 3)
+                dy = random.gauss(0, 2)
+                nx = max(50, min(1200, self.last_x + dx))
+                ny = max(50, min(700, self.last_y + dy))
+                await self._dispatch_mouse("mouseMoved", nx, ny)
+                self.last_x, self.last_y = nx, ny
+                await asyncio.sleep(random.uniform(0.05, 0.2))
+            else:
+                for _ in range(random.randint(2, 5)):
+                    dx = random.gauss(0, 5)
+                    dy = random.gauss(0, 3)
+                    nx = max(50, min(1200, self.last_x + dx))
+                    ny = max(50, min(700, self.last_y + dy))
+                    await self._dispatch_mouse("mouseMoved", nx, ny)
+                    self.last_x, self.last_y = nx, ny
+                    await asyncio.sleep(random.uniform(0.02, 0.08))
+                await asyncio.sleep(random.uniform(0.5, 2.0))
 
     async def micro_scroll(self) -> None:
-        """Небольшой скролл вверх-вниз перед действием."""
+        """Небольшой скролл."""
         direction = random.choice([-1, 1])
         delta = random.randint(30, 120) * direction
         await self.page.send(inp.dispatch_mouse_event(
@@ -83,7 +94,6 @@ class HumanClicker:
             delta_y=delta,
         ))
         await asyncio.sleep(random.uniform(0.2, 0.5))
-        # Иногда скроллим обратно
         if random.random() < 0.4:
             await self.page.send(inp.dispatch_mouse_event(
                 type_="mouseWheel",
@@ -97,14 +107,21 @@ class HumanClicker:
     # ── Internal ───────────────────────────────────────────────
 
     async def _move_to(self, tx: float, ty: float) -> None:
-        """Bezier-кривая от текущей позиции до цели."""
+        """Bezier curve with acceleration-aware timing."""
+        steps = random.randint(15, 35)
         points = self._bezier_curve(
-            self.last_x, self.last_y, tx, ty,
-            steps=random.randint(15, 35)
+            self.last_x, self.last_y, tx, ty, steps=steps
         )
-        for px, py in points:
+        for i, (px, py) in enumerate(points):
             await self._dispatch_mouse("mouseMoved", px, py)
-            await asyncio.sleep(random.uniform(0.005, 0.02))
+            t = i / max(len(points) - 1, 1)
+            if t < 0.2:
+                delay = random.uniform(0.012, 0.025)
+            elif t > 0.8:
+                delay = random.uniform(0.010, 0.022)
+            else:
+                delay = random.uniform(0.004, 0.012)
+            await asyncio.sleep(delay)
         self.last_x, self.last_y = tx, ty
 
     async def _mouse_down(self, x: float, y: float) -> None:
@@ -147,23 +164,23 @@ class HumanClicker:
 
     @staticmethod
     def _bezier_curve(x0, y0, x1, y1, steps=25) -> list[tuple[float, float]]:
-        """Cubic bezier с 2 случайными контрольными точками."""
-        # Контрольные точки со смещением для естественности
-        cp1x = x0 + (x1 - x0) * random.uniform(0.1, 0.4) + random.uniform(-50, 50)
-        cp1y = y0 + (y1 - y0) * random.uniform(0.0, 0.3) + random.uniform(-30, 30)
-        cp2x = x0 + (x1 - x0) * random.uniform(0.6, 0.9) + random.uniform(-50, 50)
-        cp2y = y0 + (y1 - y0) * random.uniform(0.7, 1.0) + random.uniform(-30, 30)
+        """Cubic bezier with distance-scaled control points."""
+        dist = math.hypot(x1 - x0, y1 - y0)
+        spread = max(10, dist * 0.15)
+
+        cp1x = x0 + (x1 - x0) * random.uniform(0.15, 0.4) + random.gauss(0, spread * 0.3)
+        cp1y = y0 + (y1 - y0) * random.uniform(0.0, 0.3) + random.gauss(0, spread * 0.3)
+        cp2x = x0 + (x1 - x0) * random.uniform(0.6, 0.85) + random.gauss(0, spread * 0.3)
+        cp2y = y0 + (y1 - y0) * random.uniform(0.7, 1.0) + random.gauss(0, spread * 0.3)
 
         points = []
         for i in range(steps + 1):
             t = i / steps
-            # Easing — чуть быстрее в середине, медленнее к краям
             t = t * t * (3 - 2 * t)
             u = 1 - t
             px = u**3 * x0 + 3 * u**2 * t * cp1x + 3 * u * t**2 * cp2x + t**3 * x1
             py = u**3 * y0 + 3 * u**2 * t * cp1y + 3 * u * t**2 * cp2y + t**3 * y1
-            # Микро-тремор (человеческая рука)
-            px += random.uniform(-1.5, 1.5)
-            py += random.uniform(-1.5, 1.5)
+            px += random.gauss(0, 0.8)
+            py += random.gauss(0, 0.8)
             points.append((px, py))
         return points

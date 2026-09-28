@@ -28,7 +28,7 @@ import time
 
 import nodriver as uc
 
-from antidetect import get_chrome_args, inject_stealth, setup_stealth_on_new_page
+from antidetect import get_chrome_args, setup_stealth_on_new_page
 from config import Config
 from dom_dumper import dump_page
 from human_clicker import HumanClicker
@@ -76,6 +76,7 @@ class VFSBrowser:
         self.logged_in = False
         self.on_dashboard = False
         self.last_login_time: float = 0
+        self._session_ttl: float = random.uniform(1500, 2400)
         self.cf_fail_count: int = 0
 
     # ── Browser lifecycle ──────────────────────────────────────────
@@ -111,15 +112,19 @@ class VFSBrowser:
         return clean, auth
 
     async def _setup_proxy_auth(self, page, username: str, password: str) -> None:
-        """Handle proxy authentication via CDP Fetch domain."""
+        """Handle proxy authentication via CDP Fetch domain.
+        Disables Fetch after first auth to reduce CDP timing footprint."""
         try:
             import nodriver.cdp.fetch as fetch_cdp
+            auth_done = {"count": 0}
+
             await page.send(fetch_cdp.enable(handle_auth_requests=True, patterns=[
                 fetch_cdp.RequestPattern(request_stage=fetch_cdp.RequestStage.RESPONSE),
             ]))
 
             def on_auth(event: fetch_cdp.AuthRequired):
                 import asyncio
+                auth_done["count"] += 1
                 asyncio.ensure_future(page.send(
                     fetch_cdp.continue_with_auth(
                         request_id=event.request_id,
@@ -140,6 +145,15 @@ class VFSBrowser:
             page.add_handler(fetch_cdp.AuthRequired, on_auth)
             page.add_handler(fetch_cdp.RequestPaused, on_request_paused)
             logger.info("Proxy auth configured via CDP Fetch")
+
+            # Auth happens on first request — navigate, wait, then disable Fetch
+            await page.get("https://visa.vfsglobal.com/favicon.ico")
+            await asyncio.sleep(2)
+            try:
+                await page.send(fetch_cdp.disable())
+                logger.info("Proxy auth done (count=%d), Fetch disabled", auth_done["count"])
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("Proxy auth setup failed: %s — proxy may not require auth", e)
 
@@ -283,7 +297,10 @@ class VFSBrowser:
         logger.info("Cloudflare challenge — ждём до %dс...", timeout)
         t0 = time.time()
         while time.time() - t0 < timeout:
-            await asyncio.sleep(3)
+            if self.hc:
+                await self.hc.idle_drift(random.uniform(2.0, 4.0))
+            else:
+                await asyncio.sleep(3)
             if await self._page_state() != "cloudflare":
                 logger.info("Cloudflare пройден (%.0fс)", time.time() - t0)
                 return True
@@ -406,7 +423,6 @@ class VFSBrowser:
                     await asyncio.sleep(backoff)
                 return False
             self.cf_fail_count = 0
-            await inject_stealth(self.page)
             state = await self._page_state()
         if state == "captcha":
             if not await self._solve_turnstile():
@@ -636,7 +652,6 @@ class VFSBrowser:
             logger.warning("Warming failed, прямой заход")
             await self.page.get(Config.VFS_URL)
         await self._delay(3, 5)
-        await inject_stealth(self.page)
 
         for attempt in range(4):
             state = await self._page_state()
@@ -649,7 +664,6 @@ class VFSBrowser:
             if state == "cloudflare":
                 if not await self._wait_cloudflare():
                     return False
-                await inject_stealth(self.page)
                 continue
 
             if state == "captcha":
@@ -774,6 +788,7 @@ class VFSBrowser:
         self.logged_in = True
         self.on_dashboard = final_state == "dashboard"
         self.last_login_time = time.time()
+        self._session_ttl = random.uniform(1500, 2400)
         try:
             await self.interceptor.attach(self.page)
         except Exception as e:
@@ -1052,9 +1067,15 @@ class VFSBrowser:
                         if (!el) return false;
                         if (el.classList.contains('d-none')) return false;
                         if (el.getAttribute('aria-hidden') === 'true') return false;
-                        if (el.offsetParent === null && el.style.position !== 'fixed') return false;
+                        if (el.tabIndex === -1 && el.type === 'hidden') return false;
+                        const cs = window.getComputedStyle(el);
+                        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                        if (parseFloat(cs.opacity) < 0.1) return false;
+                        if (el.offsetParent === null && cs.position !== 'fixed') return false;
                         const rect = el.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
+                        if (rect.width <= 0 || rect.height <= 0) return false;
+                        if (rect.right < 0 || rect.bottom < 0 || rect.left > window.innerWidth) return false;
+                        return true;
                     }})()
                 """)
                 if visible:
@@ -1077,4 +1098,4 @@ class VFSBrowser:
     def session_alive(self) -> bool:
         if not self.logged_in:
             return False
-        return (time.time() - self.last_login_time) < 1800
+        return (time.time() - self.last_login_time) < self._session_ttl
