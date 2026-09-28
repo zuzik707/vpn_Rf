@@ -354,22 +354,16 @@ async def run_monitor():
 
     # Загружаем аккаунты из БД
     accounts = get_enabled_accounts()
-    if not accounts:
-        logger.error("Нет аккаунтов! Добавь через Telegram бот: /add email:password")
-        # Если в .env есть хотя бы один — используем его как fallback
-        if Config.VFS_ACCOUNTS:
-            accounts = Config.VFS_ACCOUNTS
-        else:
-            print("Нет аккаунтов. Добавь в .env (VFS_EMAIL/VFS_PASSWORD) или через TG бот (/add)")
-            sys.exit(1)
-    else:
-        # Дополняем proxy из Config если не указан в БД
-        for acct in accounts:
-            if not acct.get("proxy"):
-                acct["proxy"] = Config.PROXY_URL
+    if not accounts and Config.VFS_ACCOUNTS:
+        accounts = Config.VFS_ACCOUNTS
+
+    # Дополняем proxy из Config если не указан в БД
+    for acct in accounts:
+        if not acct.get("proxy"):
+            acct["proxy"] = Config.PROXY_URL
 
     n = len(accounts)
-    mode = "parallel" if n > 1 else "single"
+    mode = "parallel" if n > 1 else ("single" if n == 1 else "waiting")
 
     hot_mode_shared = {"until": 0.0, "active": False}
     worker_tasks: dict[str, asyncio.Task] = {}
@@ -395,7 +389,7 @@ async def run_monitor():
         tg_bot.start()
         logger.info("Telegram бот запущен — управляй аккаунтами через /add, /list, /status")
 
-    acct_list = ", ".join(a["email"] for a in accounts)
+    acct_list = ", ".join(a["email"] for a in accounts) if accounts else "нет — добавь через /add или /reg"
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
     proxy_safe = Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else (Config.PROXY_URL[:30] or "none")
     await asyncio.to_thread(notify_status,
@@ -405,32 +399,33 @@ async def run_monitor():
         f"Proxy: {proxy_safe}\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
         f"Ночь: {Config.CHECK_INTERVAL_NIGHT_MIN}-{Config.CHECK_INTERVAL_NIGHT_MAX}с\n"
-        f"TG бот: {'ON' if tg_bot else 'OFF'} | /add /list /status\n"
+        f"TG бот: {'ON' if tg_bot else 'OFF'} | /add /list /reg /status\n"
         f"Stack: nodriver + HumanClicker + {n}x Chrome"
     )
 
-    # Heartbeat task
+    # Heartbeat + new account watcher
     async def heartbeat_loop():
         last_hb = time.time()
         while running:
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
+
+            # Проверяем новые аккаунты каждые 30 сек
+            db_accounts = get_enabled_accounts()
+            active_emails = {email for email in worker_tasks if not worker_tasks[email].done()}
+            for acct in db_accounts:
+                if acct["email"] not in active_emails:
+                    if not acct.get("proxy"):
+                        acct["proxy"] = Config.PROXY_URL
+                    wid = len(worker_tasks)
+                    logger.info("Новый воркер для %s (W%d)", acct["email"], wid)
+                    t = asyncio.create_task(
+                        run_worker(wid, acct, solver, budget, stats, hot_mode_shared))
+                    worker_tasks[acct["email"]] = t
+
             if time.time() - last_hb >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
                 if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
                     hot_mode_shared["active"] = False
                     await asyncio.to_thread(notify_status, "Hot mode закончился — слоты разобрали")
-
-                # Проверяем новые аккаунты из БД
-                db_accounts = get_enabled_accounts()
-                active_emails = {email for email in worker_tasks if not worker_tasks[email].done()}
-                for acct in db_accounts:
-                    if acct["email"] not in active_emails:
-                        if not acct.get("proxy"):
-                            acct["proxy"] = Config.PROXY_URL
-                        wid = len(worker_tasks)
-                        logger.info("Запускаю нового воркера для %s (W%d)", acct["email"], wid)
-                        t = asyncio.create_task(
-                            run_worker(wid, acct, solver, budget, stats, hot_mode_shared))
-                        worker_tasks[acct["email"]] = t
 
                 workers_alive = sum(1 for t in worker_tasks.values() if not t.done())
                 proxy_info = f"Proxy: {Config.PROXY_URL.split('@')[-1]}" if Config.PROXY_URL else "Proxy: не настроен"
