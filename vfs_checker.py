@@ -379,12 +379,12 @@ class VFSBrowser:
 
     # ── Cloudflare / CAPTCHA ───────────────────────────────────────
 
-    async def _wait_cloudflare(self, timeout: int = 90) -> bool:
+    async def _wait_cloudflare(self, timeout: int = 120) -> bool:
         logger.info("Cloudflare challenge — ждём до %dс...", timeout)
         t0 = time.time()
         click_count = 0
         max_clicks = 5
-        next_click_at = 8
+        widget_ready = False
         solve_attempted = False
         while time.time() - t0 < timeout:
             if self.hc:
@@ -396,15 +396,26 @@ class VFSBrowser:
                 logger.info("Cloudflare пройден (%.0fс)", time.time() - t0)
                 return True
             elapsed = time.time() - t0
-            if click_count < max_clicks and elapsed > next_click_at:
+            # Wait for Turnstile widget to become visible (CF shows "please wait" first)
+            if not widget_ready:
+                widget_ready = await self._is_turnstile_visible()
+                if widget_ready:
+                    logger.info("CF: Turnstile widget visible after %.0fс", elapsed)
+                elif elapsed > 10 and int(elapsed) % 10 == 0:
+                    logger.debug("CF: waiting for widget to render (%.0fс)...", elapsed)
+                continue
+            # Widget is visible — try clicking
+            if click_count < max_clicks:
                 click_count += 1
                 logger.info("CF: trying Turnstile click (%d/%d)...", click_count, max_clicks)
                 if await self._try_turnstile_click():
                     if await self._page_state() not in ("cloudflare", "captcha"):
                         logger.info("Cloudflare пройден кликом (%.0fс)", time.time() - t0)
                         return True
-                next_click_at = elapsed + random.uniform(8, 14)
-            if not solve_attempted and elapsed > 40:
+                # Wait before next click
+                extra_wait = random.uniform(5, 10)
+                await asyncio.sleep(extra_wait)
+            elif not solve_attempted:
                 solve_attempted = True
                 logger.info("CF: trying Turnstile API solve...")
                 if await self._solve_turnstile():
@@ -414,6 +425,41 @@ class VFSBrowser:
         logger.error("Cloudflare timeout")
         await self._screenshot("cf_fail")
         return False
+
+    async def _is_turnstile_visible(self) -> bool:
+        """Check if Turnstile iframe has rendered (non-zero size)."""
+        try:
+            return await self.page.evaluate("""
+                (() => {
+                    for (const f of document.querySelectorAll('iframe')) {
+                        if (f.src && (f.src.includes('challenges.cloudflare.com') || f.src.includes('turnstile'))) {
+                            const r = f.getBoundingClientRect();
+                            return r.width > 10 && r.height > 10;
+                        }
+                    }
+                    // Check if any container has visible content
+                    const containers = document.querySelectorAll(
+                        '.cf-turnstile, [appcloudflarerecaptcha], app-cloudflare-captcha-container'
+                    );
+                    for (const c of containers) {
+                        // Look for iframe inside (might have empty src initially)
+                        const iframe = c.querySelector('iframe');
+                        if (iframe) {
+                            const r = iframe.getBoundingClientRect();
+                            if (r.width > 10 && r.height > 10) return true;
+                        }
+                        // Check if container itself has a rendered checkbox
+                        const r = c.getBoundingClientRect();
+                        if (r.width > 50 && r.height > 30) {
+                            // Container visible but iframe not yet — check for shadow content
+                            if (c.querySelector('[data-sitekey]')) return true;
+                        }
+                    }
+                    return false;
+                })()
+            """) or False
+        except Exception:
+            return False
 
     async def _extract_sitekey(self) -> str | None:
         return await self.page.evaluate("""
