@@ -4,10 +4,12 @@ Telegram бот для управления VFS аккаунтами и мони
 Пошаговый диалог:
   /add → бот спрашивает email → пользователь пишет email →
   бот спрашивает пароль → пользователь пишет пароль → сохранено в БД.
+  /reg email — автоматическая регистрация на VFS + сохранение в БД.
   Каждому аккаунту автоматически назначается уникальная Bright Data сессия.
 
 Команды:
-  /add           — добавить аккаунт (пошагово)
+  /reg email     — зарегистрировать аккаунт на VFS автоматически
+  /add           — добавить существующий аккаунт (пошагово)
   /remove email  — удалить аккаунт
   /list          — список всех аккаунтов
   /enable email  — включить аккаунт
@@ -16,6 +18,7 @@ Telegram бот для управления VFS аккаунтами и мони
   /help          — справка
 """
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -140,7 +143,9 @@ class TelegramBot:
         cmd = parts[0].lower().split("@")[0]
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        if cmd == "/add":
+        if cmd == "/reg" or cmd == "/register":
+            self._cmd_reg_start(chat_id, arg)
+        elif cmd == "/add":
             self._cmd_add_start(chat_id, arg)
         elif cmd in ("/remove", "/del", "/delete"):
             self._cmd_remove(arg)
@@ -201,6 +206,14 @@ class TelegramBot:
             del self._pending[chat_id]
             self._save_account(email, password)
 
+        elif step == "reg_email":
+            email = text.strip()
+            if "@" not in email or "." not in email:
+                self.send("Это не похоже на email. Попробуй ещё раз или /cancel:")
+                return
+            del self._pending[chat_id]
+            self._run_registration(email)
+
     def _save_account(self, email: str, password: str):
         proxy = _make_proxy_for_account(email)
         if add_account(email, password, proxy):
@@ -221,6 +234,66 @@ class TelegramBot:
             self._notify_accounts_changed()
         else:
             self.send(f"Ошибка добавления {email}")
+
+    # ── Авто-регистрация /reg ─────────────────────────────────────
+
+    def _cmd_reg_start(self, chat_id: str, arg: str):
+        if arg and "@" in arg:
+            self._run_registration(arg.strip())
+            return
+        self._pending[chat_id] = {"step": "reg_email"}
+        self.send("Введи email для регистрации на VFS:")
+
+    def _run_registration(self, email: str):
+        proxy = _make_proxy_for_account(email)
+        self.send(
+            f"Регистрирую <b>{email}</b> на VFS...\n"
+            f"Это займёт 30-60 секунд"
+        )
+
+        def do_reg():
+            try:
+                from vfs_register import register_account
+                loop = asyncio.new_event_loop()
+                result = loop.run_until_complete(
+                    register_account(email, proxy_url=proxy))
+                loop.close()
+
+                if result.get("success"):
+                    password = result["password"]
+                    # Сохраняем в БД
+                    if add_account(email, password, proxy):
+                        self._notify_accounts_changed()
+
+                    self.send(
+                        f"Аккаунт зарегистрирован!\n\n"
+                        f"Email: <b>{email}</b>\n"
+                        f"Пароль: <code>{password}</code>\n"
+                        f"Телефон: {result.get('phone', '?')}\n\n"
+                        f"{result.get('message', '')}\n\n"
+                        f"Сохранено в БД. Воркер запустится автоматически.\n"
+                        f"Не забудь активировать аккаунт по ссылке из письма!"
+                    )
+                    if result.get("screenshot"):
+                        try:
+                            send_telegram_photo(result["screenshot"], f"Регистрация {email}")
+                        except Exception:
+                            pass
+                else:
+                    error = result.get("error", "Неизвестная ошибка")
+                    self.send(f"Регистрация не удалась:\n<code>{error}</code>")
+                    if result.get("screenshot"):
+                        try:
+                            send_telegram_photo(result["screenshot"], f"Ошибка рег. {email}")
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.error("Registration thread error: %s", e, exc_info=True)
+                self.send(f"Ошибка регистрации: <code>{e}</code>")
+
+        t = threading.Thread(target=do_reg, daemon=True, name=f"reg-{email}")
+        t.start()
 
     # ── Остальные команды ──────────────────────────────────────────
 
@@ -290,7 +363,8 @@ class TelegramBot:
     def _cmd_help(self):
         self.send(
             "<b>VFS Monitor Bot</b>\n\n"
-            "/add — добавить аккаунт (пошагово)\n"
+            "/reg email — зарегистрировать новый аккаунт на VFS\n"
+            "/add — добавить существующий аккаунт\n"
             "/add email:password — быстро добавить\n"
             "/remove email — удалить\n"
             "/list — все аккаунты\n"
@@ -299,7 +373,7 @@ class TelegramBot:
             "/status — статус мониторинга\n"
             "/cancel — отменить текущее действие\n"
             "/help — эта справка\n\n"
-            "Каждому аккаунту автоматически назначается свой IP через Bright Data"
+            "Каждому аккаунту свой IP через Bright Data"
         )
 
     # ── Polling loop ───────────────────────────────────────────────
