@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -28,6 +29,11 @@ from notifier import send_telegram_photo
 logger = logging.getLogger(__name__)
 
 REG_URL = "https://visa.vfsglobal.com/uzb/en/lva/login"
+
+
+def _js_str(value: str) -> str:
+    """Safely embed a Python string as a JS string literal."""
+    return json.dumps(value)
 
 
 def generate_password(length: int = 12) -> str:
@@ -125,13 +131,6 @@ class VFSRegistrar:
 
     async def register(self, email: str, phone: str = "",
                        dial_code: str = "+998") -> dict:
-        """
-        Регистрирует аккаунт на VFS Global.
-
-        Returns:
-            {"success": True, "email": ..., "password": ..., "screenshot": ...}
-            или {"success": False, "error": ..., "screenshot": ...}
-        """
         password = generate_password()
 
         if not phone:
@@ -152,7 +151,7 @@ class VFSRegistrar:
 
             await self._screenshot("reg_page_loaded")
 
-            # Кликаем "I don't have an account" чтобы перейти на форму регистрации
+            # Кликаем "I don't have an account"
             clicked_reg = await self.page.evaluate("""
                 (() => {
                     const links = document.querySelectorAll('a, button, span');
@@ -185,32 +184,34 @@ class VFSRegistrar:
                 await self._delay(1, 2)
 
             # Заполняем Email
-            email_filled = await self.page.evaluate("""
-                (email) => {
+            email_js = _js_str(email)
+            email_filled = await self.page.evaluate(f"""
+                (() => {{
+                    const email = {email_js};
                     const inputs = document.querySelectorAll('input');
-                    for (const inp of inputs) {
+                    for (const inp of inputs) {{
                         if (inp.offsetParent === null) continue;
                         const cs = window.getComputedStyle(inp);
                         if (cs.display === 'none' || cs.visibility === 'hidden') continue;
                         if (inp.type === 'email' || inp.id === 'email' ||
                             (inp.placeholder && inp.placeholder.toLowerCase().includes('email')) ||
                             inp.getAttribute('formcontrolname') === 'email' ||
-                            inp.getAttribute('formcontrolname') === 'username') {
+                            inp.getAttribute('formcontrolname') === 'username') {{
                             inp.focus();
                             inp.value = '';
                             inp.dispatchEvent(new Event('focus'));
-                            for (const ch of email) {
+                            for (const ch of email) {{
                                 inp.value += ch;
-                                inp.dispatchEvent(new Event('input', {bubbles: true}));
-                            }
-                            inp.dispatchEvent(new Event('change', {bubbles: true}));
-                            inp.dispatchEvent(new Event('blur', {bubbles: true}));
+                                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            }}
+                            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
                             return true;
-                        }
-                    }
+                        }}
+                    }}
                     return false;
-                }
-            """, email)
+                }})()
+            """)
 
             if not email_filled:
                 await self._screenshot("reg_no_email_field")
@@ -218,33 +219,34 @@ class VFSRegistrar:
 
             await self._delay(0.5, 1.0)
 
-            # Заполняем Password
-            pwd_filled = await self.page.evaluate("""
-                (pwd) => {
+            # Заполняем Password + Confirm Password
+            pwd_js = _js_str(password)
+            pwd_filled = await self.page.evaluate(f"""
+                (() => {{
+                    const pwd = {pwd_js};
                     const inputs = document.querySelectorAll('input[type="password"]');
                     const visible = [];
-                    for (const inp of inputs) {
+                    for (const inp of inputs) {{
                         if (inp.offsetParent === null) continue;
                         const cs = window.getComputedStyle(inp);
                         if (cs.display === 'none' || cs.visibility === 'hidden') continue;
                         visible.push(inp);
-                    }
+                    }}
                     if (visible.length < 2) return false;
-                    // Первый password — пароль, второй — confirm
-                    for (const inp of visible.slice(0, 2)) {
+                    for (const inp of visible.slice(0, 2)) {{
                         inp.focus();
                         inp.value = '';
                         inp.dispatchEvent(new Event('focus'));
-                        for (const ch of pwd) {
+                        for (const ch of pwd) {{
                             inp.value += ch;
-                            inp.dispatchEvent(new Event('input', {bubbles: true}));
-                        }
-                        inp.dispatchEvent(new Event('change', {bubbles: true}));
-                        inp.dispatchEvent(new Event('blur', {bubbles: true}));
-                    }
+                            inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        }}
+                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                    }}
                     return true;
-                }
-            """, password)
+                }})()
+            """)
 
             if not pwd_filled:
                 await self._screenshot("reg_no_pwd_fields")
@@ -253,61 +255,63 @@ class VFSRegistrar:
             await self._delay(0.5, 1.0)
 
             # Заполняем Dial Code
-            await self.page.evaluate("""
-                (code) => {
-                    // mat-select для dial code или обычный select
+            code_js = _js_str(dial_code)
+            await self.page.evaluate(f"""
+                (() => {{
+                    const code = {code_js};
                     const selects = document.querySelectorAll('mat-select, select');
-                    for (const sel of selects) {
+                    for (const sel of selects) {{
                         const label = sel.closest('mat-form-field, .form-group, div');
                         const labelText = label ? label.textContent.toLowerCase() : '';
                         if (labelText.includes('dial') || labelText.includes('code') ||
-                            sel.getAttribute('formcontrolname')?.includes('dial') ||
-                            sel.getAttribute('formcontrolname')?.includes('code')) {
-                            if (sel.tagName === 'SELECT') {
-                                for (const opt of sel.options) {
-                                    if (opt.textContent.includes(code) || opt.value.includes(code)) {
+                            (sel.getAttribute('formcontrolname') || '').includes('dial') ||
+                            (sel.getAttribute('formcontrolname') || '').includes('code')) {{
+                            if (sel.tagName === 'SELECT') {{
+                                for (const opt of sel.options) {{
+                                    if (opt.textContent.includes(code) || opt.value.includes(code)) {{
                                         sel.value = opt.value;
-                                        sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                        sel.dispatchEvent(new Event('change', {{bubbles: true}}));
                                         return true;
-                                    }
-                                }
-                            } else {
-                                // Angular mat-select — кликаем чтобы открыть
+                                    }}
+                                }}
+                            }} else {{
                                 sel.click();
                                 return 'mat-select';
-                            }
-                        }
-                    }
+                            }}
+                        }}
+                    }}
                     return false;
-                }
-            """, dial_code)
+                }})()
+            """)
 
             await self._delay(0.5, 0.8)
 
             # Если mat-select — ищем +998 в overlay
-            await self.page.evaluate("""
-                (code) => {
+            await self.page.evaluate(f"""
+                (() => {{
+                    const code = {code_js};
                     const opts = document.querySelectorAll('mat-option, .mat-mdc-option');
-                    for (const opt of opts) {
-                        if (opt.textContent.includes(code)) {
+                    for (const opt of opts) {{
+                        if (opt.textContent.includes(code)) {{
                             opt.click();
                             return true;
-                        }
-                    }
-                    // Закрываем если не нашли
+                        }}
+                    }}
                     const backdrop = document.querySelector('.cdk-overlay-backdrop');
                     if (backdrop) backdrop.click();
                     return false;
-                }
-            """, dial_code)
+                }})()
+            """)
 
             await self._delay(0.3, 0.6)
 
             # Заполняем Mobile Number
-            await self.page.evaluate("""
-                (phone) => {
+            phone_js = _js_str(phone)
+            await self.page.evaluate(f"""
+                (() => {{
+                    const phone = {phone_js};
                     const inputs = document.querySelectorAll('input');
-                    for (const inp of inputs) {
+                    for (const inp of inputs) {{
                         if (inp.offsetParent === null) continue;
                         const cs = window.getComputedStyle(inp);
                         if (cs.display === 'none' || cs.visibility === 'hidden') continue;
@@ -317,21 +321,21 @@ class VFSRegistrar:
                         if (fc.includes('mobile') || fc.includes('phone') ||
                             ph.includes('mobile') || ph.includes('phone') ||
                             id.includes('mobile') || id.includes('phone') ||
-                            inp.type === 'tel') {
+                            inp.type === 'tel') {{
                             inp.focus();
                             inp.value = '';
-                            for (const ch of phone) {
+                            for (const ch of phone) {{
                                 inp.value += ch;
-                                inp.dispatchEvent(new Event('input', {bubbles: true}));
-                            }
-                            inp.dispatchEvent(new Event('change', {bubbles: true}));
-                            inp.dispatchEvent(new Event('blur', {bubbles: true}));
+                                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            }}
+                            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
                             return true;
-                        }
-                    }
+                        }}
+                    }}
                     return false;
-                }
-            """, phone)
+                }})()
+            """)
 
             await self._delay(0.5, 1.0)
 
@@ -432,7 +436,6 @@ class VFSRegistrar:
                 }
 
             if any(w in text for w in ["error", "failed", "invalid"]):
-                # Пытаемся найти конкретную ошибку
                 error_text = await self.page.evaluate("""
                     (() => {
                         const errs = document.querySelectorAll(
@@ -522,16 +525,12 @@ async def register_account(email: str = "", proxy_url: str = "",
                            progress_cb=None) -> dict:
     """
     Полный цикл: создать temp email → зарегать на VFS → получить письмо → активировать.
-
-    progress_cb(text) — callback для отправки прогресса в Telegram.
-    Если email пустой — создаёт через mail.tm автоматически.
     """
     from temp_mail import TempMailClient
 
     mail_client = None
     created_email = email
 
-    # Шаг 1: Создаём временный email если не передан
     if not email:
         try:
             mail_client = TempMailClient()
@@ -542,7 +541,6 @@ async def register_account(email: str = "", proxy_url: str = "",
         except Exception as e:
             return {"success": False, "error": f"Не удалось создать temp email: {e}"}
 
-    # Шаг 2: Регистрация на VFS
     registrar = VFSRegistrar(proxy_url=proxy_url)
     result = await registrar.register(created_email, phone, dial_code)
 
@@ -559,13 +557,11 @@ async def register_account(email: str = "", proxy_url: str = "",
             f"Жду письмо активации..."
         )
 
-    # Шаг 3: Ждём письмо активации
     if not auto_activate:
         result["email"] = created_email
         return result
 
     if not mail_client:
-        # Email передан извне — не можем проверить почту автоматически
         result["email"] = created_email
         result["message"] = "Аккаунт создан! Активируй вручную по ссылке из письма."
         return result
@@ -584,7 +580,6 @@ async def register_account(email: str = "", proxy_url: str = "",
         result["message"] = "Регистрация OK, но письмо не пришло за 2 мин. Проверь почту вручную."
         return result
 
-    # Шаг 4: Извлекаем ссылку активации
     activation_link = mail_client.extract_activation_link(message)
     if not activation_link:
         all_links = mail_client.get_all_links(message)
@@ -595,7 +590,6 @@ async def register_account(email: str = "", proxy_url: str = "",
     if progress_cb:
         progress_cb("Письмо получено! Активирую аккаунт...")
 
-    # Шаг 5: Открываем ссылку активации через тот же прокси
     activator = VFSRegistrar(proxy_url=proxy_url)
     act_result = await activator.activate_account(activation_link)
 
