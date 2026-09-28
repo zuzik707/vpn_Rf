@@ -240,18 +240,30 @@ class VFSBrowser:
     async def _extract_sitekey(self) -> str | None:
         return await self.page.evaluate("""
             (() => {
+                // 1. data-sitekey на виджете
                 let el = document.querySelector('[data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
                 el = document.querySelector('.cf-turnstile[data-sitekey]');
                 if (el) return el.getAttribute('data-sitekey');
+                // 2. VFS оборачивает в <app-cloudflare-captcha-container> → <div appcloudflarerecaptcha>
+                el = document.querySelector('[appcloudflarerecaptcha] [data-sitekey]');
+                if (el) return el.getAttribute('data-sitekey');
+                // 3. iframe URL
                 const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
                 if (iframe) {
                     const m = iframe.src.match(/[?&]k=([^&]+)/);
                     if (m) return m[1];
                 }
+                // 4. Inline script
                 for (const s of document.querySelectorAll('script')) {
                     if (!s.textContent) continue;
                     const m = s.textContent.match(/sitekey['"]?\\s*[:=]\\s*['"]([0-9a-zA-Z_-]{20,})['"]/);
+                    if (m) return m[1];
+                }
+                // 5. Turnstile render call
+                for (const s of document.querySelectorAll('script')) {
+                    if (!s.textContent) continue;
+                    const m = s.textContent.match(/turnstile\\.render[^}]*sitekey['"]?\\s*:\\s*['"]([^'"]+)['"]/);
                     if (m) return m[1];
                 }
                 return null;
@@ -274,7 +286,10 @@ class VFSBrowser:
         safe = token.replace("\\", "\\\\").replace("'", "\\'")
         await self.page.evaluate(f"""
             (() => {{
-                for (const n of ['cf-turnstile-response','g-recaptcha-response']) {{
+                // VFS: hidden input name="cf-turnstile-response" внутри
+                // <app-cloudflare-captcha-container>
+                const names = ['cf-turnstile-response','g-recaptcha-response'];
+                for (const n of names) {{
                     const el = document.querySelector('[name="'+n+'"]') || document.getElementById(n);
                     if (el) {{
                         el.value = '{safe}';
@@ -282,14 +297,32 @@ class VFSBrowser:
                         el.dispatchEvent(new Event('change', {{bubbles:true}}));
                     }}
                 }}
-                for (const cb of ['tsCallback','turnstileCallback','onTurnstileSuccess','cfCallback','captchaCallback']) {{
+                // Также VFS может иметь id вида cf-chl-widget-XXXX_response
+                document.querySelectorAll('input[id*="cf-chl-widget"]').forEach(el => {{
+                    el.value = '{safe}';
+                    el.dispatchEvent(new Event('input', {{bubbles:true}}));
+                    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                }});
+                // Вызываем callback'и
+                const callbacks = [
+                    'tsCallback','turnstileCallback','onTurnstileSuccess',
+                    'cfCallback','captchaCallback'
+                ];
+                for (const cb of callbacks) {{
                     if (typeof window[cb]==='function') try {{ window[cb]('{safe}'); }} catch(e) {{}}
                 }}
-                const widgets = document.querySelectorAll('.cf-turnstile[data-callback]');
+                const widgets = document.querySelectorAll('.cf-turnstile[data-callback], [appcloudflarerecaptcha] [data-callback]');
                 widgets.forEach(w => {{
                     const fn = window[w.getAttribute('data-callback')];
                     if (typeof fn==='function') try {{ fn('{safe}'); }} catch(e) {{}}
                 }});
+                // Angular: trigger change detection
+                if (window.ng) {{
+                    try {{
+                        const appRef = window.ng.getComponent(document.querySelector('app-root'));
+                        if (appRef) appRef.detectChanges?.();
+                    }} catch(e) {{}}
+                }}
             }})()
         """)
         logger.info("Turnstile token инжектирован")
@@ -318,71 +351,24 @@ class VFSBrowser:
 
     async def _select_dropdown_option(self, dropdown_label: str, option_text: str) -> bool:
         """
-        Находим dropdown по тексту label'а и выбираем option по тексту.
-        VFS использует обычные HTML <select> элементы.
+        Выбираем option в dropdown.
+        VFS использует Angular Material (mat-select, mat-mdc-*) — это PRIMARY путь.
+        Обычные <select> — fallback.
         """
         logger.info("Выбираю '%s' в '%s'...", option_text, dropdown_label)
 
-        # Ищем select, связанный с label
-        selected = await self.page.evaluate(f"""
-            (() => {{
-                const optText = '{option_text.replace("'", "\\'")}';
-                const labelText = '{dropdown_label.replace("'", "\\'")}';
-
-                // Все select'ы на странице
-                const selects = document.querySelectorAll('select');
-                for (const sel of selects) {{
-                    // Проверяем label
-                    let labelEl = null;
-                    if (sel.id) labelEl = document.querySelector('label[for="'+sel.id+'"]');
-                    if (!labelEl) labelEl = sel.closest('div,fieldset')?.querySelector('label');
-                    const lText = (labelEl?.textContent || '').toLowerCase();
-                    const sLabel = labelText.toLowerCase();
-
-                    // Ищем select, чей label содержит нужный текст
-                    if (!lText.includes(sLabel) && !sLabel.includes('centre') && !sLabel.includes('center')) {{
-                        // Также проверяем по предшествующему тексту
-                        const prev = sel.previousElementSibling;
-                        const prevText = (prev?.textContent || '').toLowerCase();
-                        if (!prevText.includes(sLabel)) continue;
-                    }}
-
-                    // Ищем option с нужным текстом
-                    for (const opt of sel.options) {{
-                        if (opt.text.toLowerCase().includes(optText.toLowerCase())) {{
-                            sel.value = opt.value;
-                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            sel.dispatchEvent(new Event('input', {{bubbles: true}}));
-                            return true;
-                        }}
-                    }}
-                }}
-
-                // Fallback: ищем по всем select'ам на странице
-                for (const sel of selects) {{
-                    for (const opt of sel.options) {{
-                        if (opt.text.toLowerCase().includes(optText.toLowerCase())) {{
-                            sel.value = opt.value;
-                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            sel.dispatchEvent(new Event('input', {{bubbles: true}}));
-                            return true;
-                        }}
-                    }}
-                }}
-
-                return false;
-            }})()
-        """)
-
-        if selected:
-            logger.info("Выбрано: '%s'", option_text)
+        # PRIMARY: Angular Material mat-select (подтверждено из F12)
+        mat_ok = await self._select_mat_dropdown(dropdown_label, option_text)
+        if mat_ok:
+            logger.info("mat-select OK: '%s'", option_text)
             await self._delay(1.0, 2.5)
             return True
 
-        # Fallback: может это Angular Material dropdown (mat-select)
-        logger.info("HTML <select> не сработал — пробую Angular mat-select...")
-        clicked = await self._try_mat_select(dropdown_label, option_text)
-        if clicked:
+        # FALLBACK: обычные HTML <select>
+        logger.info("mat-select не сработал — пробую HTML <select>...")
+        html_ok = await self._select_html_dropdown(option_text)
+        if html_ok:
+            logger.info("HTML select OK: '%s'", option_text)
             await self._delay(1.0, 2.5)
             return True
 
@@ -390,36 +376,103 @@ class VFSBrowser:
         await self._screenshot(f"dropdown_fail_{dropdown_label[:10]}")
         return False
 
-    async def _try_mat_select(self, label_text: str, option_text: str) -> bool:
-        """Для Angular Material dropdowns (mat-select)."""
+    async def _select_mat_dropdown(self, label_text: str, option_text: str) -> bool:
+        """Angular Material dropdown: найти mat-select по label → кликнуть → выбрать mat-option."""
+        # Шаг 1: Найти нужный mat-select по тексту label'а рядом
+        safe_label = label_text.replace("'", "\\'")
+        safe_option = option_text.replace("'", "\\'")
+
+        found = await self.page.evaluate(f"""
+            (() => {{
+                const label = '{safe_label}'.toLowerCase();
+                // Ищем все элементы с текстом label'а
+                const allText = document.querySelectorAll('label, span, div, p, mat-label');
+                let targetContainer = null;
+                for (const el of allText) {{
+                    if (el.textContent.toLowerCase().includes(label)) {{
+                        targetContainer = el.closest('.mat-mdc-form-field, .form-group, div');
+                        if (targetContainer) break;
+                    }}
+                }}
+                if (!targetContainer) return 'no_container';
+                // Ищем mat-select / select / role=combobox внутри контейнера
+                const dropdown = targetContainer.querySelector(
+                    'mat-select, select, [role="combobox"], [role="listbox"]'
+                );
+                if (!dropdown) {{
+                    // Может dropdown рядом, а не внутри
+                    const next = targetContainer.nextElementSibling;
+                    const dd = next?.querySelector('mat-select, select, [role="combobox"]') || next;
+                    if (dd) {{ dd.click(); return 'clicked_next'; }}
+                    return 'no_dropdown';
+                }}
+                dropdown.click();
+                return 'clicked';
+            }})()
+        """)
+        logger.debug("mat-select find result: %s", found)
+
+        if found not in ("clicked", "clicked_next"):
+            return False
+
+        # Шаг 2: Ждём появления overlay с опциями
+        await self._delay(0.3, 0.6)
+
+        # Шаг 3: Кликнуть нужную опцию
+        selected = await self.page.evaluate(f"""
+            (() => {{
+                const target = '{safe_option}'.toLowerCase();
+                // mat-option, role=option, cdk-overlay items
+                const opts = document.querySelectorAll(
+                    'mat-option, [role="option"], .mat-mdc-option, .cdk-option'
+                );
+                for (const o of opts) {{
+                    if (o.textContent.trim().toLowerCase().includes(target)) {{
+                        o.click();
+                        return true;
+                    }}
+                }}
+                // Fallback: ищем в overlay панели
+                const panels = document.querySelectorAll(
+                    '.cdk-overlay-pane, .mat-mdc-select-panel, .mat-select-panel'
+                );
+                for (const p of panels) {{
+                    const items = p.querySelectorAll('mat-option, [role="option"], span');
+                    for (const item of items) {{
+                        if (item.textContent.trim().toLowerCase().includes(target)) {{
+                            item.click();
+                            return true;
+                        }}
+                    }}
+                }}
+                return false;
+            }})()
+        """)
+
+        if not selected:
+            # Закрываем overlay если опция не найдена
+            await self.page.evaluate("document.body.click()")
+            await self._delay(0.2, 0.4)
+
+        return bool(selected)
+
+    async def _select_html_dropdown(self, option_text: str) -> bool:
+        """Fallback: обычные HTML <select> элементы."""
         return await self.page.evaluate(f"""
             (() => {{
-                const label = '{label_text.replace("'", "\\'")}';
-                const option = '{option_text.replace("'", "\\'")}';
-
-                // Ищем mat-select или div[role=listbox] рядом с label
-                const all = document.querySelectorAll('mat-select, [role="combobox"], .dropdown-toggle, select');
-                for (const el of all) {{
-                    // Кликаем чтобы открыть
-                    el.click();
-                }}
-
-                // Ждём появления option list
-                return new Promise(resolve => {{
-                    setTimeout(() => {{
-                        const opts = document.querySelectorAll(
-                            'mat-option, [role="option"], .dropdown-item, li.option'
-                        );
-                        for (const o of opts) {{
-                            if (o.textContent.toLowerCase().includes(option.toLowerCase())) {{
-                                o.click();
-                                resolve(true);
-                                return;
-                            }}
+                const target = '{option_text.replace("'", "\\'")}';
+                const selects = document.querySelectorAll('select');
+                for (const sel of selects) {{
+                    for (const opt of sel.options) {{
+                        if (opt.text.toLowerCase().includes(target.toLowerCase())) {{
+                            sel.value = opt.value;
+                            sel.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            sel.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            return true;
                         }}
-                        resolve(false);
-                    }}, 500);
-                }});
+                    }}
+                }}
+                return false;
             }})()
         """)
 
@@ -459,12 +512,36 @@ class VFSBrowser:
                 continue
 
             if state == "login":
-                # Заполняем форму
-                email_el = await self._find_input([
-                    "input[type='email']", "input[name='email']", "input[id='email']",
-                    "input[name='username']", "input[id='username']",
-                    "input[placeholder*='mail']", "input[autocomplete='email']",
+                # HONEYPOT ALERT: VFS имеет скрытые input'ы с class="d-none"
+                # #username, #username1, #password1 — ловушки!
+                # Реальные поля: #email (formcontrolname="username"), #password
+                email_el = await self._find_visible_input([
+                    "input#email:not(.d-none)",
+                    "input[formcontrolname='username']:not(.d-none)",
+                    "input[formcontrolname='username']:not([aria-hidden='true'])",
                 ])
+                if not email_el:
+                    # Ultra-fallback: ищем видимый email input через JS
+                    email_el = await self.page.evaluate("""
+                        (() => {
+                            const inputs = document.querySelectorAll('input');
+                            for (const inp of inputs) {
+                                if (inp.classList.contains('d-none') ||
+                                    inp.getAttribute('aria-hidden') === 'true' ||
+                                    inp.offsetParent === null) continue;
+                                if (inp.type === 'email' || inp.id === 'email' ||
+                                    inp.getAttribute('formcontrolname') === 'username' ||
+                                    (inp.placeholder && inp.placeholder.includes('@'))) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        })()
+                    """)
+                    if email_el:
+                        email_el = await self.page.query_selector(
+                            "input#email, input[formcontrolname='username']"
+                        )
                 if not email_el:
                     await self._screenshot("no_email")
                     return False
@@ -474,8 +551,11 @@ class VFSBrowser:
                 await self._human_type(email_el, Config.VFS_EMAIL)
                 await self._delay(0.6, 1.2)
 
-                pwd_el = await self._find_input([
-                    "input[type='password']", "input[name='password']", "input[id='password']",
+                # Реальный password: #password (не #password1 — honeypot!)
+                pwd_el = await self._find_visible_input([
+                    "input#password:not(.d-none)",
+                    "input[formcontrolname='password']:not(.d-none)",
+                    "input[formcontrolname='password'][type='password']:not([aria-hidden='true'])",
                 ])
                 if not pwd_el:
                     await self._screenshot("no_pwd")
@@ -493,12 +573,12 @@ class VFSBrowser:
                     await self._solve_turnstile()
                     await self._delay(1, 2)
 
-                # Submit — кнопка "Sign In"
+                # Submit — кнопка "Sign In" (mat-stroked-button btn-brand-orange)
                 if not await self._click([
-                    "button[type='submit']", "input[type='submit']",
-                    "button.btn-primary", "button.mat-raised-button",
+                    "button.btn-brand-orange",
+                    "button[mat-stroked-button]",
+                    "button.mat-mdc-outlined-button",
                 ]):
-                    # Fallback: ищем кнопку по тексту "Sign In"
                     clicked = await self.page.evaluate("""
                         (() => {
                             const btns = document.querySelectorAll('button');
@@ -755,6 +835,31 @@ class VFSBrowser:
             try:
                 el = await self.page.query_selector(s)
                 if el:
+                    return el
+            except Exception:
+                continue
+        return None
+
+    async def _find_visible_input(self, selectors: list[str]):
+        """Находит input, пропуская honeypot'ы (d-none, aria-hidden, offsetParent null)."""
+        for s in selectors:
+            try:
+                el = await self.page.query_selector(s)
+                if not el:
+                    continue
+                # Дополнительная проверка видимости через JS
+                visible = await self.page.evaluate("""
+                    (sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return false;
+                        if (el.classList.contains('d-none')) return false;
+                        if (el.getAttribute('aria-hidden') === 'true') return false;
+                        if (el.offsetParent === null && el.style.position !== 'fixed') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    }
+                """, s)
+                if visible:
                     return el
             except Exception:
                 continue
