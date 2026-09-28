@@ -328,9 +328,8 @@ class VFSBrowser:
                         return 'login';
                     const hasSNB = [...document.querySelectorAll('button, a')]
                         .some(e => e.textContent.toLowerCase().includes('start new booking'));
-                    if (url.includes('/dashboard') || hasSNB) {
-                        if (hasSNB) return 'dashboard';
-                    }
+                    if (hasSNB) return 'dashboard';
+                    if (url.includes('/dashboard')) return 'dashboard';
                     if (url.includes('/appointment') || url.includes('/book')) {
                         const n = document.querySelectorAll(
                             'select, mat-select, [role="combobox"]'
@@ -965,8 +964,15 @@ class VFSBrowser:
             if state in ("dashboard", "logged_in", "appointment_form"):
                 break
 
-        # Проверяем что реально залогинились
+        # Ждём пока Angular отрендерит dashboard после логина
         final_state = await self._page_state()
+        if final_state == "unknown":
+            for _ in range(5):
+                await self._delay(1.5, 2.5)
+                final_state = await self._page_state()
+                if final_state != "unknown":
+                    break
+
         if final_state in ("login", "cloudflare", "captcha", "blocked"):
             logger.error("Логин не удался (final_state=%s)", final_state)
             await self._screenshot("login_failed")
@@ -1219,12 +1225,19 @@ class VFSBrowser:
 
         # logged_in или unknown — пробуем перейти на dashboard
         await self.page.get(f"{self.VFS_BASE}/dashboard")
-        await self._delay(2, 4)
+        await self._delay(3, 5)
         if not await self._handle_obstacle():
             return False
-        state = await self._page_state()
-        if state == "dashboard":
-            return True
+
+        # Angular SPA может рендериться медленно — retry несколько раз
+        for wait_i in range(5):
+            state = await self._page_state()
+            if state == "dashboard":
+                return True
+            if state == "login":
+                self.logged_in = False
+                return await self._ensure_dashboard(depth + 1)
+            await self._delay(1.5, 2.5)
 
         logger.warning("Не могу попасть на dashboard (state=%s)", state)
         await self._screenshot("no_dashboard")
