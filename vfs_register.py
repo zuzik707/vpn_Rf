@@ -467,6 +467,23 @@ class VFSRegistrar:
         finally:
             await self.close_browser()
 
+    def _is_activation_success(self, text: str) -> bool | None:
+        """Check activation page text. Returns True/False/None (unclear)."""
+        # Negative signals take priority — "inactive" means it didn't work
+        if any(w in text for w in [
+            "currently inactive", "account is inactive",
+            "resend the activation", "resend activation",
+        ]):
+            return False
+        # Positive signals (but NOT "sign in" alone — it appears on login page always)
+        if any(w in text for w in [
+            "activated", "successfully activated", "account is active",
+            "verification successful", "email verified",
+            "you can now login", "account has been activated",
+        ]):
+            return True
+        return None
+
     async def activate_account(self, activation_url: str) -> dict:
         """Открывает ссылку активации через тот же прокси."""
         try:
@@ -478,31 +495,46 @@ class VFSRegistrar:
             text = (await self.page.evaluate(
                 "document.body?.innerText || ''") or "").lower()
 
-            if any(w in text for w in [
-                "activated", "successfully", "account is active",
-                "verification successful", "email verified",
-                "you can now login", "sign in",
-            ]):
+            result = self._is_activation_success(text)
+            if result is True:
                 logger.info("Account activated successfully")
                 return {"success": True, "screenshot": screenshot}
+            if result is False:
+                logger.warning("Activation failed — account still inactive")
+                return {
+                    "success": False,
+                    "screenshot": screenshot,
+                    "page_text": text[:300],
+                }
 
             # Может быть CF challenge — ждём
-            for _ in range(15):
+            for _ in range(20):
                 await self._delay(2, 3)
                 text = (await self.page.evaluate(
                     "document.body?.innerText || ''") or "").lower()
-                if any(w in text for w in [
-                    "activated", "successfully", "sign in",
-                    "account is active", "verified",
-                ]):
+                result = self._is_activation_success(text)
+                if result is True:
                     screenshot = await self._screenshot("activation_success")
                     return {"success": True, "screenshot": screenshot}
-                if "checking" not in text and "moment" not in text:
+                if result is False:
+                    screenshot = await self._screenshot("activation_failed")
+                    return {
+                        "success": False,
+                        "screenshot": screenshot,
+                        "page_text": text[:300],
+                    }
+                # Still on CF challenge page — keep waiting
+                if "checking" not in text and "moment" not in text and "sign in" in text:
+                    # Landed on login page without "inactive" — might be OK
+                    # but we can't be sure, so try logging in to verify
                     break
 
             screenshot = await self._screenshot("activation_result")
+            # Final check — if we see "sign in" but NOT "inactive", cautiously report success
+            is_ok = ("activated" in text or "success" in text or
+                     ("sign in" in text and "inactive" not in text))
             return {
-                "success": "sign in" in text or "activated" in text or "success" in text,
+                "success": is_ok,
                 "screenshot": screenshot,
                 "page_text": text[:300],
             }
@@ -587,6 +619,15 @@ async def register_account(email: str = "", proxy_url: str = "",
     activator = VFSRegistrar(proxy_url=proxy_url)
     act_result = await activator.activate_account(activation_link)
 
+    # If first activation failed, try resending via the VFS login page
+    if not act_result.get("success") and mail_client:
+        if progress_cb:
+            progress_cb("Первая активация не сработала. Пробую resend...")
+        resend_ok = await _try_resend_activation(
+            created_email, proxy_url, mail_client, progress_cb)
+        if resend_ok:
+            act_result = {"success": True}
+
     result["email"] = created_email
     result["activated"] = act_result.get("success", False)
     if act_result.get("screenshot"):
@@ -596,8 +637,84 @@ async def register_account(email: str = "", proxy_url: str = "",
         result["message"] = "Аккаунт создан и активирован! Готов к работе."
     else:
         result["message"] = (
-            f"Аккаунт создан, но активация неясна. "
+            f"Аккаунт создан, но активация не удалась. "
             f"Страница: {act_result.get('page_text', '?')[:100]}"
         )
 
     return result
+
+
+async def _try_resend_activation(email: str, proxy_url: str,
+                                  mail_client, progress_cb=None) -> bool:
+    """Go to VFS login page, click 'resend activation email', wait for new email, activate."""
+    resender = VFSRegistrar(proxy_url=proxy_url)
+    try:
+        await resender.start_browser()
+        resender.page = await resender.browser.get(REG_URL)
+        await resender._delay(4, 6)
+
+        text = (await resender.page.evaluate(
+            "document.body?.innerText || ''") or "").lower()
+
+        # Look for "click here" or "resend" link on the page
+        clicked_resend = await resender.page.evaluate("""
+            (() => {
+                const links = document.querySelectorAll('a, button, span');
+                for (const el of links) {
+                    const t = el.textContent.toLowerCase().trim();
+                    if (t.includes('click here') || t.includes('resend') ||
+                        t.includes('re-send') || t.includes('send again')) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+
+        if not clicked_resend:
+            logger.warning("Resend activation link not found on page")
+            return False
+
+        await resender._delay(3, 5)
+
+        # Check if resend was successful
+        text = (await resender.page.evaluate(
+            "document.body?.innerText || ''") or "").lower()
+        if "sent" in text or "resent" in text or "check your email" in text:
+            logger.info("Activation email resent successfully")
+        else:
+            logger.info("Clicked resend, waiting for email anyway...")
+
+    except Exception as e:
+        logger.error("Resend activation error: %s", e)
+        return False
+    finally:
+        await resender.close_browser()
+
+    # Wait for the new activation email
+    if progress_cb:
+        progress_cb("Resend запрошен, жду новое письмо...")
+
+    try:
+        message = mail_client.wait_for_email(
+            from_contains="vfsglobal", timeout_sec=120, poll_sec=5)
+    except Exception as e:
+        logger.error("Mail poll error after resend: %s", e)
+        return False
+
+    if not message:
+        logger.warning("No activation email after resend")
+        return False
+
+    activation_link = mail_client.extract_activation_link(message)
+    if not activation_link:
+        logger.warning("No activation link in resent email")
+        return False
+
+    if progress_cb:
+        progress_cb("Новое письмо получено! Активирую повторно...")
+
+    activator2 = VFSRegistrar(proxy_url=proxy_url)
+    act_result = await activator2.activate_account(activation_link)
+    return act_result.get("success", False)

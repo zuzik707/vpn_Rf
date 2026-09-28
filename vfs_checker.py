@@ -1147,6 +1147,13 @@ class VFSBrowser:
                 continue
 
             if state == "login":
+                # Check if account is inactive BEFORE trying to log in
+                text = await self._text()
+                if "currently inactive" in text or "resend the activation" in text:
+                    logger.error("[W%d] Account %s is INACTIVE on VFS", self.worker_id, self.email)
+                    await self._screenshot("account_inactive")
+                    return False
+
                 # Dismiss cookie consent banner if present
                 await self._dismiss_cookie_banner()
                 # HONEYPOT ALERT: VFS имеет скрытые input'ы с class="d-none"
@@ -1253,6 +1260,10 @@ class VFSBrowser:
 
                 if state == "login":
                     text = await self._text()
+                    if "currently inactive" in text or "resend the activation" in text:
+                        logger.error("[W%d] Account %s is INACTIVE", self.worker_id, self.email)
+                        await self._screenshot("account_inactive_after_login")
+                        return False
                     if any(w in text for w in ["incorrect", "invalid", "wrong", "failed"]):
                         logger.error("Неверный логин/пароль!")
                         return False
