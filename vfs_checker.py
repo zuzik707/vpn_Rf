@@ -25,6 +25,8 @@ import json
 import logging
 import os
 import random
+import shutil
+import subprocess
 import time
 
 import nodriver as uc
@@ -155,6 +157,36 @@ class VFSBrowser:
 
     # ── Browser lifecycle ──────────────────────────────────────────
 
+    @staticmethod
+    def _ensure_virtual_display() -> bool:
+        """Start Xvfb virtual display if no DISPLAY is set.
+        Cloudflare detects headless Chrome and blocks Turnstile rendering."""
+        if os.environ.get("DISPLAY"):
+            return True
+        if not shutil.which("Xvfb"):
+            logger.warning("Xvfb not found — installing...")
+            try:
+                subprocess.run(["apt-get", "install", "-y", "xvfb"],
+                               capture_output=True, timeout=60)
+            except Exception:
+                pass
+        if not shutil.which("Xvfb"):
+            logger.error("Xvfb unavailable — Chrome will run headless (CF may block)")
+            return False
+        display_num = 99
+        os.environ["DISPLAY"] = f":{display_num}"
+        try:
+            subprocess.Popen(
+                ["Xvfb", f":{display_num}", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+            logger.info("Xvfb started on :%d — Chrome will run in headed mode", display_num)
+            return True
+        except Exception as e:
+            logger.error("Xvfb start failed: %s — Chrome will run headless", e)
+            del os.environ["DISPLAY"]
+            return False
+
     async def start_browser(self) -> None:
         os.makedirs(self._browser_data_dir, exist_ok=True)
         os.makedirs(Config.SCREENSHOT_DIR, exist_ok=True)
@@ -182,10 +214,13 @@ class VFSBrowser:
                 logger.info("[W%d] Proxy (direct): %s", self.worker_id, proxy_for_chrome)
         has_display = bool(os.environ.get("DISPLAY"))
         if not has_display:
-            logger.warning("No DISPLAY — using headless='new'. For best results: apt install xvfb && xvfb-run python main.py")
+            has_display = self._ensure_virtual_display()
+        use_headless = not has_display
+        if use_headless:
+            logger.warning("No virtual display — headless mode (CF may block Turnstile)")
         self.browser = await uc.start(
             user_data_dir=self._browser_data_dir,
-            headless="new" if not has_display else False,
+            headless="new" if use_headless else False,
             lang="en-US",
             browser_args=args,
         )
