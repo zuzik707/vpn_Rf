@@ -29,8 +29,8 @@ import time
 import nodriver as uc
 
 from antidetect import get_chrome_args, inject_stealth, setup_stealth_on_new_page
-from captcha_solver import CaptchaSolver
 from config import Config
+from network_interceptor import NetworkInterceptor
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +63,11 @@ BLOCKED_MARKERS = [
 
 
 class VFSBrowser:
-    def __init__(self):
+    def __init__(self, captcha_solver=None):
         self.browser: uc.Browser | None = None
         self.page: uc.Tab | None = None
-        self.captcha_solver = CaptchaSolver()
+        self.captcha_solver = captcha_solver
+        self.interceptor = NetworkInterceptor()
         self.logged_in = False
         self.on_dashboard = False
         self.last_login_time: float = 0
@@ -76,15 +77,20 @@ class VFSBrowser:
     async def start_browser(self) -> None:
         os.makedirs(Config.BROWSER_DATA_DIR, exist_ok=True)
         os.makedirs(Config.SCREENSHOT_DIR, exist_ok=True)
+        args = get_chrome_args()
+        if Config.PROXY_URL:
+            args.append(f"--proxy-server={Config.PROXY_URL}")
+            logger.info("Proxy: %s", Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else Config.PROXY_URL)
         self.browser = await uc.start(
             user_data_dir=Config.BROWSER_DATA_DIR,
             headless=False,
             lang="en-US",
-            browser_args=get_chrome_args(),
+            browser_args=args,
         )
         logger.info("Chrome запущен (nodriver)")
 
     async def close_browser(self) -> None:
+        await self.interceptor.detach()
         if self.browser:
             try:
                 self.browser.stop()
@@ -134,29 +140,84 @@ class VFSBrowser:
             pass
         return path
 
+    async def _url(self) -> str:
+        try:
+            return (await self.page.evaluate("window.location.href")) or ""
+        except Exception:
+            return ""
+
     async def _page_state(self) -> str:
-        """Определяем где мы находимся."""
+        """
+        Определяем где мы на сайте VFS.
+        Приоритет: URL → DOM-элементы → текст.
+        Так надёжнее чем только текст — если VFS поменяет фразу, URL и DOM останутся.
+        """
+        url = (await self._url()).lower()
         html = await self._html()
         text = await self._text()
         both = html + " " + text
 
+        # Blocked — проверяем первым
         if any(m in both for m in BLOCKED_MARKERS):
             return "blocked"
+
+        # Cloudflare challenge — по URL и DOM
+        if "challenges.cloudflare.com" in url or "/cdn-cgi/" in url:
+            return "cloudflare"
         if any(m in both for m in CLOUDFLARE_MARKERS):
             return "cloudflare"
-        if any(m in both for m in CAPTCHA_MARKERS):
+
+        # Captcha — по iframe/виджету
+        has_captcha = await self.page.evaluate("""
+            (() => {
+                return !!(
+                    document.querySelector('.cf-turnstile') ||
+                    document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+                    document.querySelector('[data-sitekey]') ||
+                    document.querySelector('.h-captcha') ||
+                    document.querySelector('.g-recaptcha')
+                );
+            })()
+        """)
+        if has_captcha:
             return "captcha"
 
-        # Dashboard — после логина
-        if "start new booking" in both:
-            return "dashboard"
-        # Appointment Details form — Step 1
+        # Login — по URL + наличие password input
+        if "/login" in url:
+            has_pwd = await self.page.evaluate(
+                "!!document.querySelector('input[type=\"password\"]')"
+            )
+            if has_pwd:
+                return "login"
+
+        # Dashboard — по URL + кнопка Start New Booking
+        if "/dashboard" in url or "start new booking" in both:
+            has_btn = await self.page.evaluate("""
+                (() => {
+                    const els = document.querySelectorAll('button, a');
+                    return [...els].some(e =>
+                        e.textContent.toLowerCase().includes('start new booking')
+                    );
+                })()
+            """)
+            if has_btn:
+                return "dashboard"
+
+        # Appointment form — по URL + наличие select/dropdown'ов
+        if "/appointment" in url or "/book" in url:
+            has_selects = await self.page.evaluate(
+                "document.querySelectorAll('select, mat-select, [role=\"combobox\"]').length >= 2"
+            )
+            if has_selects:
+                return "appointment_form"
+
+        # Fallback текстовые маркеры
         if "appointment details" in both and "choose your" in both:
             return "appointment_form"
-        # Login page
+        if "start new booking" in both:
+            return "dashboard"
         if ("sign in" in both or "log in" in both) and "password" in both:
             return "login"
-        # Sign out link = мы залогинены
         if "sign out" in both or "my account" in both:
             return "logged_in"
 
@@ -432,12 +493,25 @@ class VFSBrowser:
                     await self._solve_turnstile()
                     await self._delay(1, 2)
 
-                # Submit
+                # Submit — кнопка "Sign In"
                 if not await self._click([
                     "button[type='submit']", "input[type='submit']",
                     "button.btn-primary", "button.mat-raised-button",
                 ]):
-                    await pwd_el.send_keys("\r")
+                    # Fallback: ищем кнопку по тексту "Sign In"
+                    clicked = await self.page.evaluate("""
+                        (() => {
+                            const btns = document.querySelectorAll('button');
+                            for (const b of btns) {
+                                if (b.textContent.trim().toLowerCase() === 'sign in') {
+                                    b.click(); return true;
+                                }
+                            }
+                            return false;
+                        })()
+                    """)
+                    if not clicked:
+                        await pwd_el.send_keys("\r")
 
                 await self._delay(4, 8)
                 state = await self._page_state()
@@ -458,6 +532,11 @@ class VFSBrowser:
         self.logged_in = True
         self.on_dashboard = (await self._page_state()) == "dashboard"
         self.last_login_time = time.time()
+        # Подключаем перехват API после успешного логина
+        try:
+            await self.interceptor.attach(self.page)
+        except Exception as e:
+            logger.warning("Interceptor attach failed: %s", e)
         logger.info("Login OK (state=%s)", await self._page_state())
         return True
 
@@ -555,9 +634,21 @@ class VFSBrowser:
 
         await self._delay(2.0, 4.0)
 
-        # Шаг 7: Читаем результат
+        # Шаг 7: Читаем результат — двойная проверка (API + DOM)
+        # Сначала проверяем перехваченные API-ответы
+        if self.interceptor.has_data:
+            api_result = await self.interceptor.check_api_slots()
+            if api_result.available:
+                screenshot = await self._screenshot("slots_found")
+                info = f"API: слоты найдены!"
+                if api_result.earliest_date:
+                    info += f" Ближайшая дата: {api_result.earliest_date}"
+                if api_result.dates:
+                    info += f" Даты: {', '.join(api_result.dates[:5])}"
+                logger.info("СЛОТЫ (API): %s", info)
+                return True, info, screenshot
+
         text = await self._text()
-        html = await self._html()
 
         # Проверяем банер "нет слотов"
         if NO_SLOTS_TEXT in text:
