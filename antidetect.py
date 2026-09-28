@@ -76,7 +76,6 @@ def get_chrome_args(profile_path: str = "") -> list[str]:
     return [
         f"--window-size={width},{height}",
         "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
         "--no-first-run",
         "--no-default-browser-check",
         "--lang=en-US",
@@ -84,7 +83,5 @@ def get_chrome_args(profile_path: str = "") -> list[str]:
         "--enforce-webrtc-ip-permission-check",
         "--disable-dev-shm-usage",
         "--no-sandbox",
-        "--disable-sync",
-        "--disable-translate",
         "--mute-audio",
     ]

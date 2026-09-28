@@ -90,21 +90,26 @@ def build_stealth_script(profile: dict) -> str:
     w, h = vp
 
     return f"""
-    // --- Helper: native-looking defineProperty (value-based, correct descriptors) ---
+    // --- Helpers ---
     const _nativeDef = (obj, prop, val) => {{
         Object.defineProperty(obj, prop, {{
             value: val, configurable: true, enumerable: true, writable: false
         }});
     }};
-    // Helper: spoof toString on patched functions
+    const _nativeGetter = (obj, prop, val) => {{
+        const fn = function() {{ return val; }};
+        _spoofToString(fn, 'get ' + prop);
+        Object.defineProperty(obj, prop, {{
+            get: fn, configurable: true, enumerable: true
+        }});
+    }};
     const _spoofToString = (fn, name) => {{
         fn.toString = () => 'function ' + name + '() {{ [native code] }}';
         if (fn.toString.toString) fn.toString.toString = () => 'function toString() {{ [native code] }}';
     }};
 
-    // --- 1. webdriver cleanup ---
-    _nativeDef(Navigator.prototype, 'webdriver', undefined);
-    try {{ delete navigator.__proto__.webdriver; }} catch(e) {{}}
+    // --- 1. webdriver = false (real Chrome has false, not undefined) ---
+    _nativeGetter(Navigator.prototype, 'webdriver', false);
 
     // --- 2. WebGL fingerprint (toString-safe) ---
     const _patchGL = (proto) => {{
@@ -120,18 +125,34 @@ def build_stealth_script(profile: dict) -> str:
     _patchGL(WebGLRenderingContext.prototype);
     if (typeof WebGL2RenderingContext !== 'undefined') _patchGL(WebGL2RenderingContext.prototype);
 
-    // --- 3. Hardware specs (value-based, not getter) ---
-    _nativeDef(Navigator.prototype, 'hardwareConcurrency', {hc});
-    _nativeDef(Navigator.prototype, 'deviceMemory', {dm});
+    // --- 3. Hardware specs (getters, not values — CF checks descriptors) ---
+    _nativeGetter(Navigator.prototype, 'hardwareConcurrency', {hc});
+    _nativeGetter(Navigator.prototype, 'deviceMemory', {dm});
 
     // --- 4. navigator.languages ---
     Object.defineProperty(Navigator.prototype, 'languages', {{
         get: () => Object.freeze(['en-US', 'en', 'uz']),
         configurable: true, enumerable: true
     }});
-    _nativeDef(Navigator.prototype, 'language', 'en-US');
+    _nativeGetter(Navigator.prototype, 'language', 'en-US');
 
-    // --- 5. chrome.runtime stub ---
+    // --- 5. navigator.plugins (real Chrome has PDF plugins) ---
+    Object.defineProperty(Navigator.prototype, 'plugins', {{
+        get: () => {{
+            const arr = [
+                {{name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1}},
+                {{name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: '', length: 1}},
+                {{name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: '', length: 1}},
+            ];
+            arr.item = (i) => arr[i];
+            arr.namedItem = (n) => arr.find(p => p.name === n);
+            arr.refresh = () => {{}};
+            return arr;
+        }},
+        configurable: true, enumerable: true
+    }});
+
+    // --- 6. chrome.runtime + chrome.app stubs ---
     if (!window.chrome) window.chrome = {{}};
     if (!window.chrome.runtime) {{
         window.chrome.runtime = {{
@@ -140,6 +161,13 @@ def build_stealth_script(profile: dict) -> str:
             getManifest: function() {{}},
             getURL: function(p) {{ return ''; }},
             PlatformOs: {{ANDROID:'android',CROS:'cros',LINUX:'linux',MAC:'mac',OPENBSD:'openbsd',WIN:'win'}},
+        }};
+    }}
+    if (!window.chrome.app) {{
+        window.chrome.app = {{
+            isInstalled: false,
+            InstallState: {{DISABLED:'disabled',INSTALLED:'installed',NOT_INSTALLED:'not_installed'}},
+            RunningState: {{CANNOT_RUN:'cannot_run',READY_TO_RUN:'ready_to_run',RUNNING:'running'}},
         }};
     }}
 
