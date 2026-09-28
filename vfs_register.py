@@ -469,9 +469,147 @@ class VFSRegistrar:
         finally:
             await self.close_browser()
 
+    async def activate_account(self, activation_url: str) -> dict:
+        """Открывает ссылку активации через тот же прокси."""
+        try:
+            await self.start_browser()
+            self.page = await self.browser.get(activation_url)
+            await self._delay(5, 8)
 
-async def register_account(email: str, proxy_url: str = "",
-                           phone: str = "", dial_code: str = "+998") -> dict:
-    """Удобная обёртка для вызова из TG бота."""
+            screenshot = await self._screenshot("activation_page")
+            text = (await self.page.evaluate(
+                "document.body?.innerText || ''") or "").lower()
+
+            if any(w in text for w in [
+                "activated", "successfully", "account is active",
+                "verification successful", "email verified",
+                "you can now login", "sign in",
+            ]):
+                logger.info("Account activated successfully")
+                return {"success": True, "screenshot": screenshot}
+
+            # Может быть CF challenge — ждём
+            for _ in range(15):
+                await self._delay(2, 3)
+                text = (await self.page.evaluate(
+                    "document.body?.innerText || ''") or "").lower()
+                if any(w in text for w in [
+                    "activated", "successfully", "sign in",
+                    "account is active", "verified",
+                ]):
+                    screenshot = await self._screenshot("activation_success")
+                    return {"success": True, "screenshot": screenshot}
+                if "checking" not in text and "moment" not in text:
+                    break
+
+            screenshot = await self._screenshot("activation_result")
+            return {
+                "success": "sign in" in text or "activated" in text or "success" in text,
+                "screenshot": screenshot,
+                "page_text": text[:300],
+            }
+
+        except Exception as e:
+            logger.error("Activation error: %s", e, exc_info=True)
+            return {"success": False, "error": str(e)}
+        finally:
+            await self.close_browser()
+
+
+async def register_account(email: str = "", proxy_url: str = "",
+                           phone: str = "", dial_code: str = "+998",
+                           auto_activate: bool = True,
+                           progress_cb=None) -> dict:
+    """
+    Полный цикл: создать temp email → зарегать на VFS → получить письмо → активировать.
+
+    progress_cb(text) — callback для отправки прогресса в Telegram.
+    Если email пустой — создаёт через mail.tm автоматически.
+    """
+    from temp_mail import TempMailClient
+
+    mail_client = None
+    created_email = email
+
+    # Шаг 1: Создаём временный email если не передан
+    if not email:
+        try:
+            mail_client = TempMailClient()
+            prefix = f"vfs{int(time.time()) % 100000}"
+            created_email = mail_client.create_account(prefix)
+            if progress_cb:
+                progress_cb(f"Email создан: <code>{created_email}</code>")
+        except Exception as e:
+            return {"success": False, "error": f"Не удалось создать temp email: {e}"}
+
+    # Шаг 2: Регистрация на VFS
     registrar = VFSRegistrar(proxy_url=proxy_url)
-    return await registrar.register(email, phone, dial_code)
+    result = await registrar.register(created_email, phone, dial_code)
+
+    if not result.get("success"):
+        return result
+
+    password = result["password"]
+
+    if progress_cb:
+        progress_cb(
+            f"VFS регистрация OK!\n"
+            f"Email: <code>{created_email}</code>\n"
+            f"Пароль: <code>{password}</code>\n"
+            f"Жду письмо активации..."
+        )
+
+    # Шаг 3: Ждём письмо активации
+    if not auto_activate:
+        result["email"] = created_email
+        return result
+
+    if not mail_client:
+        # Email передан извне — не можем проверить почту автоматически
+        result["email"] = created_email
+        result["message"] = "Аккаунт создан! Активируй вручную по ссылке из письма."
+        return result
+
+    try:
+        message = mail_client.wait_for_email(
+            from_contains="vfsglobal", timeout_sec=120, poll_sec=5)
+    except Exception as e:
+        logger.error("Mail polling error: %s", e)
+        result["email"] = created_email
+        result["message"] = f"Регистрация OK, но письмо не получено: {e}. Активируй вручную."
+        return result
+
+    if not message:
+        result["email"] = created_email
+        result["message"] = "Регистрация OK, но письмо не пришло за 2 мин. Проверь почту вручную."
+        return result
+
+    # Шаг 4: Извлекаем ссылку активации
+    activation_link = mail_client.extract_activation_link(message)
+    if not activation_link:
+        all_links = mail_client.get_all_links(message)
+        result["email"] = created_email
+        result["message"] = f"Письмо получено, но ссылка не найдена. Ссылки: {all_links[:3]}"
+        return result
+
+    if progress_cb:
+        progress_cb("Письмо получено! Активирую аккаунт...")
+
+    # Шаг 5: Открываем ссылку активации через тот же прокси
+    activator = VFSRegistrar(proxy_url=proxy_url)
+    act_result = await activator.activate_account(activation_link)
+
+    result["email"] = created_email
+    result["activated"] = act_result.get("success", False)
+    if act_result.get("screenshot"):
+        result["activation_screenshot"] = act_result["screenshot"]
+
+    if act_result.get("success"):
+        result["message"] = "Аккаунт создан и активирован! Готов к работе."
+    else:
+        result["message"] = (
+            f"Аккаунт создан, но активация неясна. "
+            f"Страница: {act_result.get('page_text', '?')[:100]}"
+        )
+
+    return result

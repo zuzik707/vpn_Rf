@@ -239,61 +239,100 @@ class TelegramBot:
 
     def _cmd_reg_start(self, chat_id: str, arg: str):
         if arg and "@" in arg:
+            # Юзер передал свой email
             self._run_registration(arg.strip())
-            return
-        self._pending[chat_id] = {"step": "reg_email"}
-        self.send("Введи email для регистрации на VFS:")
+        elif arg:
+            # Юзер передал количество или prefix
+            try:
+                count = int(arg)
+                self._run_batch_registration(count)
+            except ValueError:
+                self._run_registration("", prefix=arg.strip())
+        else:
+            # Без аргументов — создаём temp email автоматически
+            self._run_registration("")
 
-    def _run_registration(self, email: str):
-        proxy = _make_proxy_for_account(email)
+    def _run_registration(self, email: str, prefix: str = ""):
+        if email:
+            proxy = _make_proxy_for_account(email)
+            display = email
+        else:
+            proxy = _make_proxy_for_account(prefix or f"auto{int(time.time())}")
+            display = "авто (mail.tm)"
+
         self.send(
-            f"Регистрирую <b>{email}</b> на VFS...\n"
-            f"Это займёт 30-60 секунд"
+            f"Регистрирую аккаунт на VFS...\n"
+            f"Email: <b>{display}</b>\n"
+            f"Полный цикл: регистрация → письмо → активация\n"
+            f"Это займёт 1-3 минуты"
         )
+
+        bot = self  # capture for closure
 
         def do_reg():
             try:
                 from vfs_register import register_account
                 loop = asyncio.new_event_loop()
                 result = loop.run_until_complete(
-                    register_account(email, proxy_url=proxy))
+                    register_account(
+                        email=email,
+                        proxy_url=proxy,
+                        auto_activate=True,
+                        progress_cb=bot.send,
+                    ))
                 loop.close()
 
                 if result.get("success"):
+                    final_email = result.get("email", email)
                     password = result["password"]
-                    # Сохраняем в БД
-                    if add_account(email, password, proxy):
-                        self._notify_accounts_changed()
+                    final_proxy = _make_proxy_for_account(final_email)
 
-                    self.send(
-                        f"Аккаунт зарегистрирован!\n\n"
-                        f"Email: <b>{email}</b>\n"
+                    # Сохраняем в БД
+                    if add_account(final_email, password, final_proxy):
+                        bot._notify_accounts_changed()
+
+                    activated = result.get("activated", False)
+                    status = "АКТИВИРОВАН" if activated else "Нужна активация"
+
+                    bot.send(
+                        f"Аккаунт готов!\n\n"
+                        f"Email: <code>{final_email}</code>\n"
                         f"Пароль: <code>{password}</code>\n"
-                        f"Телефон: {result.get('phone', '?')}\n\n"
+                        f"Телефон: {result.get('phone', '?')}\n"
+                        f"Статус: <b>{status}</b>\n\n"
                         f"{result.get('message', '')}\n\n"
-                        f"Сохранено в БД. Воркер запустится автоматически.\n"
-                        f"Не забудь активировать аккаунт по ссылке из письма!"
+                        f"Сохранено в БД. Воркер запустится автоматически."
                     )
-                    if result.get("screenshot"):
-                        try:
-                            send_telegram_photo(result["screenshot"], f"Регистрация {email}")
-                        except Exception:
-                            pass
+                    for key in ("screenshot", "activation_screenshot"):
+                        if result.get(key):
+                            try:
+                                send_telegram_photo(result[key], f"Рег. {final_email}")
+                            except Exception:
+                                pass
                 else:
                     error = result.get("error", "Неизвестная ошибка")
-                    self.send(f"Регистрация не удалась:\n<code>{error}</code>")
+                    bot.send(f"Регистрация не удалась:\n<code>{error}</code>")
                     if result.get("screenshot"):
                         try:
-                            send_telegram_photo(result["screenshot"], f"Ошибка рег. {email}")
+                            send_telegram_photo(result["screenshot"], "Ошибка регистрации")
                         except Exception:
                             pass
 
             except Exception as e:
                 logger.error("Registration thread error: %s", e, exc_info=True)
-                self.send(f"Ошибка регистрации: <code>{e}</code>")
+                bot.send(f"Ошибка регистрации: <code>{e}</code>")
 
-        t = threading.Thread(target=do_reg, daemon=True, name=f"reg-{email}")
+        t = threading.Thread(target=do_reg, daemon=True, name=f"reg-{email or 'auto'}")
         t.start()
+
+    def _run_batch_registration(self, count: int):
+        if count < 1 or count > 20:
+            self.send("Количество: от 1 до 20")
+            return
+        self.send(f"Запускаю регистрацию {count} аккаунтов...")
+        for i in range(count):
+            self._run_registration("")
+            time.sleep(2)  # small gap between launches
 
     # ── Остальные команды ──────────────────────────────────────────
 
@@ -363,16 +402,18 @@ class TelegramBot:
     def _cmd_help(self):
         self.send(
             "<b>VFS Monitor Bot</b>\n\n"
-            "/reg email — зарегистрировать новый аккаунт на VFS\n"
+            "<b>Регистрация:</b>\n"
+            "/reg — создать 1 аккаунт (авто email + регистрация + активация)\n"
+            "/reg 5 — создать 5 аккаунтов разом\n"
+            "/reg user@mail.com — зарегать с конкретным email\n\n"
+            "<b>Управление:</b>\n"
             "/add — добавить существующий аккаунт\n"
-            "/add email:password — быстро добавить\n"
             "/remove email — удалить\n"
             "/list — все аккаунты\n"
             "/enable email — включить\n"
             "/disable email — выключить\n"
             "/status — статус мониторинга\n"
-            "/cancel — отменить текущее действие\n"
-            "/help — эта справка\n\n"
+            "/cancel — отменить\n\n"
             "Каждому аккаунту свой IP через Bright Data"
         )
 
