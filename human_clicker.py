@@ -54,7 +54,7 @@ class HumanClicker:
             await element.scroll_into_view()
         except Exception:
             try:
-                await element.apply("(el) => el.scrollIntoView({behavior: 'smooth', block: 'center'})")
+                await element.apply("function() { this.scrollIntoView({behavior: 'smooth', block: 'center'}) }")
             except Exception:
                 pass
         await asyncio.sleep(random.uniform(0.3, 0.7))

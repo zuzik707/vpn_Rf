@@ -84,9 +84,11 @@ class VFSBrowser:
         os.makedirs(Config.BROWSER_DATA_DIR, exist_ok=True)
         os.makedirs(Config.SCREENSHOT_DIR, exist_ok=True)
         args = get_chrome_args()
+        self._proxy_auth = None
         if Config.PROXY_URL:
-            args.append(f"--proxy-server={Config.PROXY_URL}")
-            logger.info("Proxy: %s", Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else Config.PROXY_URL)
+            proxy_for_chrome, self._proxy_auth = self._parse_proxy_url(Config.PROXY_URL)
+            args.append(f"--proxy-server={proxy_for_chrome}")
+            logger.info("Proxy: %s", proxy_for_chrome.split("@")[-1] if "@" in proxy_for_chrome else proxy_for_chrome)
         self.browser = await uc.start(
             user_data_dir=Config.BROWSER_DATA_DIR,
             headless=False,
@@ -94,6 +96,52 @@ class VFSBrowser:
             browser_args=args,
         )
         logger.info("Chrome запущен (nodriver)")
+
+    @staticmethod
+    def _parse_proxy_url(url: str) -> tuple[str, tuple[str, str] | None]:
+        """Extract auth from proxy URL. Chrome --proxy-server ignores credentials."""
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        auth = None
+        if parsed.username:
+            auth = (parsed.username, parsed.password or "")
+            clean = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        else:
+            clean = url
+        return clean, auth
+
+    async def _setup_proxy_auth(self, page, username: str, password: str) -> None:
+        """Handle proxy authentication via CDP Fetch domain."""
+        try:
+            import nodriver.cdp.fetch as fetch_cdp
+            await page.send(fetch_cdp.enable(handle_auth_requests=True, patterns=[
+                fetch_cdp.RequestPattern(request_stage=fetch_cdp.RequestStage.RESPONSE),
+            ]))
+
+            def on_auth(event: fetch_cdp.AuthRequired):
+                import asyncio
+                asyncio.ensure_future(page.send(
+                    fetch_cdp.continue_with_auth(
+                        request_id=event.request_id,
+                        auth_challenge_response=fetch_cdp.AuthChallengeResponse(
+                            response="ProvideCredentials",
+                            username=username,
+                            password=password,
+                        )
+                    )
+                ))
+
+            def on_request_paused(event: fetch_cdp.RequestPaused):
+                import asyncio
+                asyncio.ensure_future(page.send(
+                    fetch_cdp.continue_request(request_id=event.request_id)
+                ))
+
+            page.add_handler(fetch_cdp.AuthRequired, on_auth)
+            page.add_handler(fetch_cdp.RequestPaused, on_request_paused)
+            logger.info("Proxy auth configured via CDP Fetch")
+        except Exception as e:
+            logger.warning("Proxy auth setup failed: %s — proxy may not require auth", e)
 
     async def close_browser(self) -> None:
         await self.interceptor.detach()
@@ -574,6 +622,8 @@ class VFSBrowser:
 
         self.page = await self.browser.get("about:blank")
         await setup_stealth_on_new_page(self.page)
+        if self._proxy_auth:
+            await self._setup_proxy_auth(self.page, *self._proxy_auth)
         self.hc = HumanClicker(self.page)
         self.warmer = SessionWarmer(self.page, self.hc)
         await self._delay(0.5, 1.0)

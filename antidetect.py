@@ -83,25 +83,10 @@ STEALTH_SCRIPTS = [
     };
     """,
 
-    # 8. Предотвращаем детект через Error stack trace (automation frameworks оставляют следы)
-    """
-    const origError = Error;
-    Error = function(...args) {
-        const err = new origError(...args);
-        const stack = err.stack;
-        if (stack) {
-            err.stack = stack.split('\\n').filter(line =>
-                !line.includes('puppeteer') &&
-                !line.includes('playwright') &&
-                !line.includes('selenium') &&
-                !line.includes('webdriver') &&
-                !line.includes('nodriver')
-            ).join('\\n');
-        }
-        return err;
-    };
-    Error.prototype = origError.prototype;
-    """,
+    # 8. Removed: Error constructor override was a detection vector itself.
+    # nodriver uses CDP directly — "nodriver"/"puppeteer" never appear in
+    # in-page stack traces. The override broke Error.captureStackTrace,
+    # Error.name, Error.stackTraceLimit — all checked by Cloudflare.
 
     # 9. Подменяем connection rtt (headless часто 0)
     """

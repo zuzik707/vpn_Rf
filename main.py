@@ -226,6 +226,11 @@ async def run_monitor():
                 await asyncio.to_thread(notify_status, heartbeat_msg)
                 last_heartbeat = time.time()
                 cleanup_screenshots()
+                try:
+                    from dom_dumper import cleanup_dumps
+                    cleanup_dumps()
+                except Exception:
+                    pass
 
             # Random skip — как нерегулярный пользователь
             if should_random_skip() and not (time.time() < hot_mode_until):
