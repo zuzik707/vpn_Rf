@@ -370,22 +370,47 @@ class VFSBrowser:
 
     # ── Select dropdown by visible text ────────────────────────────
 
+    # formcontrolname → mat-select ID (из реального F12 HTML)
+    DROPDOWN_MAP = {
+        "centre": "centerCode",
+        "category": "selectedSubvisaCategory",
+        "subcategory": "visaCategoryCode",
+    }
+
     async def _select_dropdown_option(self, dropdown_label: str, option_text: str) -> bool:
         """
-        Выбираем option в dropdown.
-        VFS использует Angular Material (mat-select, mat-mdc-*) — это PRIMARY путь.
-        Обычные <select> — fallback.
+        Выбираем option в mat-select dropdown.
+        VFS использует Angular Material — подтверждено из F12.
+        Точные formcontrolname: centerCode, selectedSubvisaCategory, visaCategoryCode.
         """
         logger.info("Выбираю '%s' в '%s'...", option_text, dropdown_label)
 
-        # PRIMARY: Angular Material mat-select (подтверждено из F12)
-        mat_ok = await self._select_mat_dropdown(dropdown_label, option_text)
+        # Определяем formcontrolname по label
+        fcn = None
+        label_low = dropdown_label.lower()
+        if "centre" in label_low or "center" in label_low:
+            fcn = self.DROPDOWN_MAP["centre"]
+        elif "sub" in label_low:
+            fcn = self.DROPDOWN_MAP["subcategory"]
+        elif "category" in label_low:
+            fcn = self.DROPDOWN_MAP["category"]
+
+        # PRIMARY: прямой доступ по formcontrolname (самый надёжный)
+        if fcn:
+            ok = await self._select_mat_by_fcn(fcn, option_text)
+            if ok:
+                logger.info("mat-select[%s] OK: '%s'", fcn, option_text)
+                await self._delay(1.0, 2.5)
+                return True
+
+        # FALLBACK 1: поиск по тексту label'а
+        mat_ok = await self._select_mat_by_label(dropdown_label, option_text)
         if mat_ok:
-            logger.info("mat-select OK: '%s'", option_text)
+            logger.info("mat-select (label) OK: '%s'", option_text)
             await self._delay(1.0, 2.5)
             return True
 
-        # FALLBACK: обычные HTML <select>
+        # FALLBACK 2: обычные HTML <select>
         logger.info("mat-select не сработал — пробую HTML <select>...")
         html_ok = await self._select_html_dropdown(option_text)
         if html_ok:
@@ -395,57 +420,46 @@ class VFSBrowser:
 
         logger.warning("Не удалось выбрать '%s'", option_text)
         await self._screenshot(f"dropdown_fail_{dropdown_label[:10]}")
+        await dump_page(self.page, f"dropdown_fail_{dropdown_label[:10]}")
         return False
 
-    async def _select_mat_dropdown(self, label_text: str, option_text: str) -> bool:
-        """Angular Material dropdown: найти mat-select по label → кликнуть → выбрать mat-option."""
-        # Шаг 1: Найти нужный mat-select по тексту label'а рядом
-        safe_label = label_text.replace("'", "\\'")
+    async def _select_mat_by_fcn(self, formcontrolname: str, option_text: str) -> bool:
+        """Точный путь: находим mat-select по formcontrolname, кликаем, выбираем option."""
+        safe_fcn = formcontrolname.replace("'", "\\'")
         safe_option = option_text.replace("'", "\\'")
 
-        found = await self.page.evaluate(f"""
+        # Проверяем — может уже выбрано нужное значение?
+        already = await self.page.evaluate(f"""
             (() => {{
-                const label = '{safe_label}'.toLowerCase();
-                // Ищем все элементы с текстом label'а
-                const allText = document.querySelectorAll('label, span, div, p, mat-label');
-                let targetContainer = null;
-                for (const el of allText) {{
-                    if (el.textContent.toLowerCase().includes(label)) {{
-                        targetContainer = el.closest('.mat-mdc-form-field, .form-group, div');
-                        if (targetContainer) break;
-                    }}
-                }}
-                if (!targetContainer) return 'no_container';
-                // Ищем mat-select / select / role=combobox внутри контейнера
-                const dropdown = targetContainer.querySelector(
-                    'mat-select, select, [role="combobox"], [role="listbox"]'
-                );
-                if (!dropdown) {{
-                    // Может dropdown рядом, а не внутри
-                    const next = targetContainer.nextElementSibling;
-                    const dd = next?.querySelector('mat-select, select, [role="combobox"]') || next;
-                    if (dd) {{ dd.click(); return 'clicked_next'; }}
-                    return 'no_dropdown';
-                }}
-                dropdown.click();
-                return 'clicked';
+                const sel = document.querySelector('mat-select[formcontrolname="{safe_fcn}"]');
+                if (!sel) return null;
+                const val = sel.querySelector('.mat-mdc-select-min-line');
+                return val ? val.textContent.trim() : null;
             }})()
         """)
-        logger.debug("mat-select find result: %s", found)
+        if already and already.lower().strip() == option_text.lower().strip():
+            logger.info("Уже выбрано: '%s'", already)
+            return True
 
-        if found not in ("clicked", "clicked_next"):
+        # Кликаем mat-select чтобы открыть overlay
+        el = await self.page.query_selector(f'mat-select[formcontrolname="{safe_fcn}"]')
+        if not el:
+            logger.debug("mat-select[formcontrolname=%s] не найден", formcontrolname)
             return False
 
-        # Шаг 2: Ждём появления overlay с опциями
-        await self._delay(0.3, 0.6)
+        if self.hc:
+            await self.hc.scroll_into_view(el)
+            await self.hc.click(el)
+        else:
+            await el.click()
+        await self._delay(0.4, 0.8)
 
-        # Шаг 3: Кликнуть нужную опцию
+        # Выбираем нужную опцию из overlay
         selected = await self.page.evaluate(f"""
             (() => {{
                 const target = '{safe_option}'.toLowerCase();
-                // mat-option, role=option, cdk-overlay items
                 const opts = document.querySelectorAll(
-                    'mat-option, [role="option"], .mat-mdc-option, .cdk-option'
+                    'mat-option, [role="option"], .mat-mdc-option'
                 );
                 for (const o of opts) {{
                     if (o.textContent.trim().toLowerCase().includes(target)) {{
@@ -453,13 +467,12 @@ class VFSBrowser:
                         return true;
                     }}
                 }}
-                // Fallback: ищем в overlay панели
+                // overlay panel fallback
                 const panels = document.querySelectorAll(
-                    '.cdk-overlay-pane, .mat-mdc-select-panel, .mat-select-panel'
+                    '.cdk-overlay-pane, .mat-mdc-select-panel'
                 );
                 for (const p of panels) {{
-                    const items = p.querySelectorAll('mat-option, [role="option"], span');
-                    for (const item of items) {{
+                    for (const item of p.querySelectorAll('mat-option, [role="option"]')) {{
                         if (item.textContent.trim().toLowerCase().includes(target)) {{
                             item.click();
                             return true;
@@ -471,7 +484,58 @@ class VFSBrowser:
         """)
 
         if not selected:
-            # Закрываем overlay если опция не найдена
+            await self.page.evaluate("document.body.click()")
+            await self._delay(0.2, 0.4)
+
+        return bool(selected)
+
+    async def _select_mat_by_label(self, label_text: str, option_text: str) -> bool:
+        """Fallback: поиск mat-select по тексту label'а рядом."""
+        safe_label = label_text.replace("'", "\\'")
+        safe_option = option_text.replace("'", "\\'")
+
+        found = await self.page.evaluate(f"""
+            (() => {{
+                const label = '{safe_label}'.toLowerCase();
+                const allText = document.querySelectorAll('label, span, div, p, mat-label');
+                let targetContainer = null;
+                for (const el of allText) {{
+                    if (el.textContent.toLowerCase().includes(label)) {{
+                        targetContainer = el.closest('.form-group, .mat-mdc-form-field');
+                        if (targetContainer) break;
+                    }}
+                }}
+                if (!targetContainer) return 'no_container';
+                const dropdown = targetContainer.querySelector(
+                    'mat-select, [role="combobox"]'
+                );
+                if (!dropdown) return 'no_dropdown';
+                dropdown.click();
+                return 'clicked';
+            }})()
+        """)
+        if found != "clicked":
+            return False
+
+        await self._delay(0.4, 0.8)
+
+        selected = await self.page.evaluate(f"""
+            (() => {{
+                const target = '{safe_option}'.toLowerCase();
+                const opts = document.querySelectorAll(
+                    'mat-option, [role="option"], .mat-mdc-option'
+                );
+                for (const o of opts) {{
+                    if (o.textContent.trim().toLowerCase().includes(target)) {{
+                        o.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+        """)
+
+        if not selected:
             await self.page.evaluate("document.body.click()")
             await self._delay(0.2, 0.4)
 
@@ -741,19 +805,25 @@ class VFSBrowser:
             if "choose your" not in text:
                 return False, f"Неожиданная страница: {text[:200]}", None
 
-        # Шаг 4: Выбираем Centre
+        # Шаг 4: Выбираем Centre (formcontrolname="centerCode")
+        if self.hc:
+            await self.hc.micro_scroll()
         if not await self._select_dropdown_option("Application Centre", Config.VFS_CENTRE):
             return False, "Не удалось выбрать Centre", None
 
         await self._delay(1.5, 3.0)
 
-        # Шаг 5: Выбираем Category
+        # Шаг 5: Выбираем Category (formcontrolname="selectedSubvisaCategory")
+        if self.hc:
+            await self.hc.idle_drift(random.uniform(0.3, 0.8))
         if not await self._select_dropdown_option("appointment category", Config.VFS_CATEGORY):
             return False, "Не удалось выбрать Category", None
 
         await self._delay(1.5, 3.0)
 
-        # Шаг 6: Выбираем Sub-category
+        # Шаг 6: Выбираем Sub-category (formcontrolname="visaCategoryCode")
+        if self.hc:
+            await self.hc.idle_drift(random.uniform(0.3, 0.8))
         if not await self._select_dropdown_option("sub-category", subcategory):
             return False, f"Не удалось выбрать Sub-category: {subcategory}", None
 
@@ -775,18 +845,33 @@ class VFSBrowser:
 
         text = await self._text()
 
-        # Проверяем банер "нет слотов"
+        # Проверяем банер "нет слотов" — div.alert с role="alert"
         if NO_SLOTS_TEXT in text:
             logger.info("Нет слотов для '%s'", subcategory)
             return False, "Нет слотов", None
 
+        # Также проверяем по DOM (div[role="alert"] внутри .Information)
+        no_slots_dom = await self.page.evaluate("""
+            (() => {
+                const alert = document.querySelector('.Information [role="alert"]');
+                if (alert && alert.textContent.toLowerCase().includes('no appointment slots')) return true;
+                return false;
+            })()
+        """)
+        if no_slots_dom:
+            logger.info("Нет слотов (DOM alert) для '%s'", subcategory)
+            return False, "Нет слотов", None
+
         # Проверяем активность кнопки Continue
+        # Из F12: button.btn-brand-orange.mat-mdc-raised-button с disabled="true"
+        # и class mat-mdc-button-disabled когда нет слотов
         continue_disabled = await self.page.evaluate("""
             (() => {
-                const btns = document.querySelectorAll('button, input[type="submit"]');
+                const btns = document.querySelectorAll('button.btn-brand-orange, button.mat-mdc-raised-button');
                 for (const b of btns) {
                     if (b.textContent.toLowerCase().includes('continue')) {
-                        return b.disabled || b.classList.contains('disabled') ||
+                        return b.disabled || b.classList.contains('mat-mdc-button-disabled') ||
+                               b.classList.contains('disabled') ||
                                b.getAttribute('aria-disabled') === 'true';
                     }
                 }
