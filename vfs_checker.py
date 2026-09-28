@@ -353,14 +353,32 @@ class VFSBrowser:
     async def _wait_cloudflare(self, timeout: int = 90) -> bool:
         logger.info("Cloudflare challenge — ждём до %dс...", timeout)
         t0 = time.time()
+        click_attempted = False
+        solve_attempted = False
         while time.time() - t0 < timeout:
             if self.hc:
                 await self.hc.idle_drift(random.uniform(2.0, 4.0))
             else:
                 await asyncio.sleep(3)
-            if await self._page_state() != "cloudflare":
+            state = await self._page_state()
+            if state not in ("cloudflare", "captcha"):
                 logger.info("Cloudflare пройден (%.0fс)", time.time() - t0)
                 return True
+            elapsed = time.time() - t0
+            if not click_attempted and elapsed > 5:
+                click_attempted = True
+                logger.info("CF: trying Turnstile click...")
+                if await self._try_turnstile_click():
+                    if await self._page_state() not in ("cloudflare", "captcha"):
+                        logger.info("Cloudflare пройден кликом (%.0fс)", time.time() - t0)
+                        return True
+            if not solve_attempted and elapsed > 20:
+                solve_attempted = True
+                logger.info("CF: trying Turnstile API solve...")
+                if await self._solve_turnstile():
+                    if await self._page_state() not in ("cloudflare", "captcha"):
+                        logger.info("Cloudflare пройден через API (%.0fс)", time.time() - t0)
+                        return True
         logger.error("Cloudflare timeout")
         await self._screenshot("cf_fail")
         return False
