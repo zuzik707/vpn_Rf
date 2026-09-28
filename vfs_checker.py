@@ -92,6 +92,7 @@ class VFSBrowser:
         self.warmer: SessionWarmer | None = None
         self.logged_in = False
         self.on_dashboard = False
+        self._on_appointment_form = False
         self.last_login_time: float = 0
         self._session_ttl: float = random.uniform(1500, 2400)
         self.cf_fail_count: int = 0
@@ -313,6 +314,7 @@ class VFSBrowser:
         self.page = None
         self.logged_in = False
         self.on_dashboard = False
+        self._on_appointment_form = False
 
     # ── Human-like helpers ─────────────────────────────────────────
 
@@ -1298,15 +1300,19 @@ class VFSBrowser:
 
     async def check_slots(self) -> tuple[bool, str, str | None]:
         """
-        Полный флоу проверки слотов:
-        Dashboard → Start New Booking → выбираем dropdown'ы → читаем результат.
-        Проверяем ОБЕ подкатегории.
+        Проверка слотов. Первый раз — полный флоу (login → dashboard → form).
+        Повторно — просто перевыбираем sub-category на той же странице
+        (без рефреша/навигации, чтобы не терять сессию).
         """
         if not self.browser or not self.logged_in:
             if not await self.login():
                 return False, "Логин не удался", None
 
         await self._ensure_proxy_auth()
+
+        # Если мы уже на форме — быстрая проверка без навигации
+        if self._on_appointment_form:
+            return await self._recheck_slots_on_form()
 
         results = []
         for subcategory in Config.VFS_SUBCATEGORIES:
@@ -1316,6 +1322,173 @@ class VFSBrowser:
             results.append(f"{subcategory}: {info}")
 
         return False, " | ".join(results), None
+
+    async def _recheck_slots_on_form(self) -> tuple[bool, str, str | None]:
+        """Быстрая перепроверка — перевыбираем sub-category без навигации."""
+        # Проверяем что страница ещё жива и мы на форме
+        try:
+            state = await self._page_state()
+        except Exception:
+            self._on_appointment_form = False
+            return await self.check_slots()
+
+        if state != "appointment_form":
+            logger.info("Страница сменилась (state=%s) — полный цикл", state)
+            self._on_appointment_form = False
+            if state in ("login", "session_expired"):
+                self.logged_in = False
+            return await self.check_slots()
+
+        results = []
+        for subcategory in Config.VFS_SUBCATEGORIES:
+            logger.info("Re-check (on form): %s", subcategory)
+            self.interceptor.clear()
+
+            # Перевыбираем sub-category — триггерит новый CheckIsSlotAvailable
+            if not await self._reselect_subcategory(subcategory):
+                logger.warning("Re-select failed — полный цикл")
+                self._on_appointment_form = False
+                return await self.check_slots()
+
+            found, info, screenshot = await self._read_slot_result(subcategory)
+            if found:
+                return True, f"[{subcategory}]\n{info}", screenshot
+            results.append(f"{subcategory}: {info}")
+
+        return False, " | ".join(results), None
+
+    async def _read_slot_result(self, subcategory: str) -> tuple[bool, str, str | None]:
+        """Ждём результат проверки слотов и читаем его (API + DOM + Continue button)."""
+        logger.info("Ждём результат проверки слотов...")
+        for wait_i in range(10):
+            await self._delay(1.5, 2.5)
+            ready = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    if (text.includes('no appointment slots')) return 'no_slots';
+                    const alert = document.querySelector('.Information [role="alert"], [role="alert"]');
+                    if (alert && alert.textContent.toLowerCase().includes('no appointment')) return 'no_slots_dom';
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent.toLowerCase().includes('continue') && !b.disabled &&
+                            !b.classList.contains('mat-mdc-button-disabled'))
+                            return 'slots_available';
+                    }
+                    for (const b of btns) {
+                        if (b.textContent.toLowerCase().includes('continue') &&
+                            (b.disabled || b.classList.contains('mat-mdc-button-disabled')))
+                            return 'no_slots_btn';
+                    }
+                    const spinner = document.querySelector('.mat-mdc-progress-spinner, mat-spinner, .loading, .spinner');
+                    if (spinner) return null;
+                    return null;
+                })()
+            """)
+            if ready:
+                logger.info("Результат готов после %.0fс: %s", (wait_i + 1) * 2, ready)
+                break
+            if self.interceptor.has_data:
+                logger.info("API ответил после %.0fс", (wait_i + 1) * 2)
+                break
+        await self._screenshot("after_subcategory_select")
+
+        # Проверяем перехваченные API-ответы
+        if self.interceptor.has_data:
+            api_result = await self.interceptor.check_api_slots()
+            if api_result.available:
+                screenshot = await self._screenshot("slots_found")
+                info = f"API: слоты найдены!"
+                if api_result.earliest_date:
+                    info += f" Ближайшая дата: {api_result.earliest_date}"
+                if api_result.dates:
+                    info += f" Даты: {', '.join(api_result.dates[:5])}"
+                logger.info("СЛОТЫ (API): %s", info)
+                return True, info, screenshot
+
+        text = await self._text()
+
+        if NO_SLOTS_TEXT in text:
+            logger.info("Нет слотов для '%s'", subcategory)
+            return False, "Нет слотов", None
+
+        no_slots_dom = await self.page.evaluate("""
+            (() => {
+                const alert = document.querySelector('.Information [role="alert"]');
+                if (alert && alert.textContent.toLowerCase().includes('no appointment slots')) return true;
+                return false;
+            })()
+        """)
+        if no_slots_dom:
+            logger.info("Нет слотов (DOM alert) для '%s'", subcategory)
+            return False, "Нет слотов", None
+
+        continue_disabled = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button.btn-brand-orange, button.mat-mdc-raised-button');
+                for (const b of btns) {
+                    if (b.textContent.toLowerCase().includes('continue')) {
+                        return b.disabled || b.classList.contains('mat-mdc-button-disabled') ||
+                               b.classList.contains('disabled') ||
+                               b.getAttribute('aria-disabled') === 'true';
+                    }
+                }
+                return null;
+            })()
+        """)
+
+        if continue_disabled is False:
+            screenshot = await self._screenshot("slots_found")
+            logger.info("СЛОТЫ НАЙДЕНЫ для '%s'!", subcategory)
+            date_info = await self.page.evaluate("""
+                (() => {
+                    const text = document.body.innerText;
+                    const lines = text.split('\\n').filter(l => l.trim());
+                    const dateLines = lines.filter(l => {
+                        const low = l.toLowerCase();
+                        return low.includes('date') || low.includes('time') ||
+                               low.includes('slot') || low.includes('available') ||
+                               /\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}/.test(l) ||
+                               /\\d{1,2}\\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(l);
+                    });
+                    return dateLines.slice(0, 10).join('\\n');
+                })()
+            """)
+            info = date_info if date_info else "Слоты доступны — кнопка Continue активна!"
+            return True, info, screenshot
+
+        if continue_disabled is True:
+            logger.info("Continue disabled, банера нет — нет слотов для '%s'", subcategory)
+            return False, "Continue disabled", None
+
+        if "no appointment" in text or "sorry" in text:
+            return False, "Нет слотов (текст)", None
+
+        screenshot = await self._screenshot("unclear")
+        await dump_page(self.page, "unclear")
+        return False, f"Неясный результат: {text[:200]}", screenshot
+
+    async def _reselect_subcategory(self, subcategory: str) -> bool:
+        """Перевыбрать sub-category dropdown чтобы триггерить новую проверку слотов."""
+        fcn = self.DROPDOWN_MAP["subcategory"]
+        safe_fcn = fcn.replace("'", "\\'")
+
+        # Сначала сбросим — выберем другую опцию или просто переоткроем
+        el = await self.page.select(f'mat-select[formcontrolname="{safe_fcn}"]')
+        if not el:
+            return False
+
+        if self.hc:
+            await self.hc.click(el)
+        else:
+            await el.click()
+        await self._delay(0.3, 0.6)
+
+        # Закроем dropdown (клик вне его, Escape)
+        await self.page.evaluate("document.querySelector('.cdk-overlay-backdrop')?.click()")
+        await self._delay(0.3, 0.5)
+
+        # Теперь выберем нужную sub-category заново
+        return await self._select_dropdown_option("sub-category", subcategory)
 
     async def _check_single_subcategory(self, subcategory: str) -> tuple[bool, str, str | None]:
         """Проверяем конкретную подкатегорию."""
@@ -1411,134 +1584,12 @@ class VFSBrowser:
         if not await self._select_dropdown_option("sub-category", subcategory):
             return False, f"Не удалось выбрать Sub-category: {subcategory}", None
 
-        # Ждём пока API ответит или появится банер/результат (до 20с)
-        logger.info("Ждём результат проверки слотов...")
-        for wait_i in range(10):
-            await self._delay(1.5, 2.5)
-            # Проверяем: спиннер пропал? банер появился? API ответил?
-            ready = await self.page.evaluate("""
-                (() => {
-                    const text = (document.body.innerText || '').toLowerCase();
-                    // Синий банер "no appointment slots"
-                    if (text.includes('no appointment slots')) return 'no_slots';
-                    // Банер через DOM
-                    const alert = document.querySelector('.Information [role="alert"], [role="alert"]');
-                    if (alert && alert.textContent.toLowerCase().includes('no appointment')) return 'no_slots_dom';
-                    // Кнопка Continue активна = слоты есть
-                    const btns = document.querySelectorAll('button');
-                    for (const b of btns) {
-                        if (b.textContent.toLowerCase().includes('continue') && !b.disabled &&
-                            !b.classList.contains('mat-mdc-button-disabled'))
-                            return 'slots_available';
-                    }
-                    // Continue disabled = нет слотов (но загрузка завершена)
-                    for (const b of btns) {
-                        if (b.textContent.toLowerCase().includes('continue') &&
-                            (b.disabled || b.classList.contains('mat-mdc-button-disabled')))
-                            return 'no_slots_btn';
-                    }
-                    // Спиннер ещё крутится
-                    const spinner = document.querySelector('.mat-mdc-progress-spinner, mat-spinner, .loading, .spinner');
-                    if (spinner) return null;
-                    // API уже ответил?
-                    return null;
-                })()
-            """)
-            if ready:
-                logger.info("Результат готов после %.0fс: %s", (wait_i + 1) * 2, ready)
-                break
-            if self.interceptor.has_data:
-                logger.info("API ответил после %.0fс", (wait_i + 1) * 2)
-                break
-        await self._screenshot("after_subcategory_select")
-
-        # Шаг 7: Читаем результат — двойная проверка (API + DOM)
-        # Сначала проверяем перехваченные API-ответы
-        if self.interceptor.has_data:
-            api_result = await self.interceptor.check_api_slots()
-            if api_result.available:
-                screenshot = await self._screenshot("slots_found")
-                info = f"API: слоты найдены!"
-                if api_result.earliest_date:
-                    info += f" Ближайшая дата: {api_result.earliest_date}"
-                if api_result.dates:
-                    info += f" Даты: {', '.join(api_result.dates[:5])}"
-                logger.info("СЛОТЫ (API): %s", info)
-                return True, info, screenshot
-
-        text = await self._text()
-
-        # Проверяем банер "нет слотов" — div.alert с role="alert"
-        if NO_SLOTS_TEXT in text:
-            logger.info("Нет слотов для '%s'", subcategory)
-            return False, "Нет слотов", None
-
-        # Также проверяем по DOM (div[role="alert"] внутри .Information)
-        no_slots_dom = await self.page.evaluate("""
-            (() => {
-                const alert = document.querySelector('.Information [role="alert"]');
-                if (alert && alert.textContent.toLowerCase().includes('no appointment slots')) return true;
-                return false;
-            })()
-        """)
-        if no_slots_dom:
-            logger.info("Нет слотов (DOM alert) для '%s'", subcategory)
-            return False, "Нет слотов", None
-
-        # Проверяем активность кнопки Continue
-        # Из F12: button.btn-brand-orange.mat-mdc-raised-button с disabled="true"
-        # и class mat-mdc-button-disabled когда нет слотов
-        continue_disabled = await self.page.evaluate("""
-            (() => {
-                const btns = document.querySelectorAll('button.btn-brand-orange, button.mat-mdc-raised-button');
-                for (const b of btns) {
-                    if (b.textContent.toLowerCase().includes('continue')) {
-                        return b.disabled || b.classList.contains('mat-mdc-button-disabled') ||
-                               b.classList.contains('disabled') ||
-                               b.getAttribute('aria-disabled') === 'true';
-                    }
-                }
-                return null;
-            })()
-        """)
-
-        if continue_disabled is False:
-            # Continue АКТИВНА = слоты ЕСТЬ!
-            screenshot = await self._screenshot("slots_found")
-            logger.info("СЛОТЫ НАЙДЕНЫ для '%s'!", subcategory)
-
-            # Пытаемся вытащить дату/время если видно
-            date_info = await self.page.evaluate("""
-                (() => {
-                    const text = document.body.innerText;
-                    const lines = text.split('\\n').filter(l => l.trim());
-                    const dateLines = lines.filter(l => {
-                        const low = l.toLowerCase();
-                        return low.includes('date') || low.includes('time') ||
-                               low.includes('slot') || low.includes('available') ||
-                               /\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}/.test(l) ||
-                               /\\d{1,2}\\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(l);
-                    });
-                    return dateLines.slice(0, 10).join('\\n');
-                })()
-            """)
-
-            info = date_info if date_info else "Слоты доступны — кнопка Continue активна!"
-            return True, info, screenshot
-
-        if continue_disabled is True:
-            # Continue ЗАБЛОКИРОВАНА но банера нет — странно, но нет слотов
-            logger.info("Continue disabled, банера нет — нет слотов для '%s'", subcategory)
-            return False, "Continue disabled", None
-
-        # Continue не найдена — проверяем текст
-        if "no appointment" in text or "sorry" in text:
-            return False, "Нет слотов (текст)", None
-
-        # Неясно — скриншот + DOM dump для анализа
-        screenshot = await self._screenshot("unclear")
-        await dump_page(self.page, "unclear")
-        return False, f"Неясный результат: {text[:200]}", screenshot
+        found, info, screenshot = await self._read_slot_result(subcategory)
+        # Мы успешно дошли до формы — ставим флаг чтобы следующие проверки
+        # не делали полный цикл (login → dashboard → form), а просто
+        # перевыбирали sub-category
+        self._on_appointment_form = True
+        return found, info, screenshot
 
     VFS_BASE = "https://visa.vfsglobal.com/uzb/en/lva"
 
