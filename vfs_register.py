@@ -41,7 +41,7 @@ def generate_password(length: int = 12) -> str:
     lower = random.choices(string.ascii_lowercase, k=4)
     upper = random.choices(string.ascii_uppercase, k=3)
     digits = random.choices(string.digits, k=3)
-    special = random.choices("!@#$%&*", k=2)
+    special = random.choices("!@*", k=2)
     pwd = lower + upper + digits + special
     random.shuffle(pwd)
     return "".join(pwd)

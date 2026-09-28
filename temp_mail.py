@@ -66,7 +66,7 @@ class TempMailClient:
         if not active:
             raise RuntimeError("Нет доступных доменов на mail.tm")
 
-        domain = active[0]["domain"]
+        domain = random.choice(active)["domain"]
 
         if not prefix:
             prefix = _random_human_prefix()
