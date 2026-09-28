@@ -54,8 +54,11 @@ class Config:
     # Retention — скриншоты старше N часов удаляются (кроме slots_found)
     SCREENSHOT_RETENTION_HOURS = int(os.getenv("SCREENSHOT_RETENTION_HOURS", "24"))
 
-    # Резидентский прокси (опционально)
+    # Резидентский прокси (опционально — вручную или через AstroProxy API)
     PROXY_URL = os.getenv("PROXY_URL", "")
+
+    # AstroProxy API (автоматическое управление прокси)
+    ASTROPROXY_TOKEN = os.getenv("ASTROPROXY_TOKEN", "")
 
     BROWSER_DATA_DIR = os.path.join(os.path.dirname(__file__), "browser_data")
     SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "screenshots")

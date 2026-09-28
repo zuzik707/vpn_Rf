@@ -146,6 +146,21 @@ async def run_monitor():
 
     budget = BudgetGuard()
 
+    # AstroProxy — автоматическое управление прокси
+    from proxy_manager import ProxyManager
+    proxy = ProxyManager()
+    if proxy.is_configured:
+        try:
+            proxy_url = proxy.setup_best_proxy()
+            Config.PROXY_URL = proxy_url
+            logger.info("AstroProxy: %s", proxy.stats_text())
+        except Exception as e:
+            logger.warning("AstroProxy setup failed: %s", e)
+    elif Config.PROXY_URL:
+        logger.info("Proxy (manual): %s", Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else "configured")
+    else:
+        logger.warning("Proxy не настроен — риск бана!")
+
     # Проверяем баланс captcha
     from captcha_solver import CaptchaSolver
     try:
@@ -200,9 +215,11 @@ async def run_monitor():
 
             # Heartbeat
             if time.time() - last_heartbeat >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
+                proxy_info = proxy.stats_text() if proxy.is_configured else "Proxy: не настроен"
                 heartbeat_msg = (
                     f"Heartbeat | {stats.summary()}\n"
                     f"{budget.stats_text()}\n"
+                    f"{proxy_info}\n"
                     f"Режим: {'день' if is_daytime() else 'ночь'} | "
                     f"Hot: {'да' if time.time() < hot_mode_until else 'нет'}"
                 )
@@ -264,6 +281,11 @@ async def run_monitor():
 
                 if consecutive_errors == 3:
                     logger.info("3 ошибки подряд — полный рестарт")
+                    # Ротация IP при повторных ошибках
+                    if proxy.is_configured:
+                        new_ip = proxy.rotate_ip()
+                        if new_ip:
+                            logger.info("IP ротация после ошибок: %s", new_ip)
                     await checker.close_browser()
                     await asyncio.sleep(random.uniform(30, 60))
 
