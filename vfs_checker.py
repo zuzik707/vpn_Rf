@@ -66,6 +66,9 @@ BLOCKED_MARKERS = [
 ]
 
 
+COOKIES_PATH = "cookies.json"
+
+
 class VFSBrowser:
     def __init__(self, captcha_solver=None):
         self.browser: uc.Browser | None = None
@@ -161,7 +164,47 @@ class VFSBrowser:
         except Exception as e:
             logger.warning("Proxy auth setup failed: %s — proxy may not require auth", e)
 
+    async def _save_cookies(self) -> None:
+        if not self.page:
+            return
+        try:
+            import nodriver.cdp.network as net_cdp
+            cookies = await self.page.send(net_cdp.get_cookies())
+            serializable = []
+            for c in cookies:
+                serializable.append({
+                    "name": c.name, "value": c.value, "domain": c.domain,
+                    "path": c.path, "expires": c.expires, "httpOnly": c.http_only,
+                    "secure": c.secure, "sameSite": c.same_site.value if c.same_site else None,
+                })
+            with open(COOKIES_PATH, "w") as f:
+                json.dump(serializable, f)
+            logger.debug("Saved %d cookies", len(serializable))
+        except Exception as e:
+            logger.debug("Cookie save failed: %s", e)
+
+    async def _restore_cookies(self) -> None:
+        if not self.page or not os.path.exists(COOKIES_PATH):
+            return
+        try:
+            import nodriver.cdp.network as net_cdp
+            with open(COOKIES_PATH) as f:
+                cookies = json.load(f)
+            for c in cookies:
+                try:
+                    await self.page.send(net_cdp.set_cookie(
+                        name=c["name"], value=c["value"], domain=c.get("domain"),
+                        path=c.get("path", "/"), expires=c.get("expires"),
+                        http_only=c.get("httpOnly", False), secure=c.get("secure", False),
+                    ))
+                except Exception:
+                    pass
+            logger.info("Restored %d cookies from disk", len(cookies))
+        except Exception as e:
+            logger.debug("Cookie restore failed: %s", e)
+
     async def close_browser(self) -> None:
+        await self._save_cookies()
         await self.interceptor.detach()
         if self.browser:
             try:
@@ -381,8 +424,28 @@ class VFSBrowser:
             return False
 
         page_url = await self.page.evaluate("window.location.href")
-        logger.info("2Captcha fallback: solving Turnstile (sitekey=%s...)", sitekey[:16])
-        token = await asyncio.to_thread(self.captcha_solver.solve_turnstile, sitekey, page_url)
+
+        token = None
+        for attempt in range(3):
+            logger.info("2Captcha: attempt %d/3 (sitekey=%s...)", attempt + 1, sitekey[:16])
+            try:
+                token = await asyncio.wait_for(
+                    asyncio.to_thread(self.captcha_solver.solve_turnstile, sitekey, page_url),
+                    timeout=150,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("2Captcha timeout on attempt %d", attempt + 1)
+                token = None
+            except Exception as e:
+                logger.warning("2Captcha error on attempt %d: %s", attempt + 1, e)
+                token = None
+            if token:
+                break
+            if attempt < 2:
+                backoff = (attempt + 1) * 5
+                logger.info("Retry in %ds...", backoff)
+                await asyncio.sleep(backoff)
+
         if not token:
             return False
 
@@ -696,6 +759,7 @@ class VFSBrowser:
             await self._setup_proxy_auth(self.page, *self._proxy_auth)
         self.hc = HumanClicker(self.page)
         self.warmer = SessionWarmer(self.page, self.hc)
+        await self._restore_cookies()
         await self._delay(0.5, 1.0)
 
         # Session warming: homepage → country → login (не прямой /login)

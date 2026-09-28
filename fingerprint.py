@@ -193,4 +193,29 @@ def build_stealth_script(profile: dict) -> str:
         }} catch(e) {{}}
         return _origToDataURL.apply(this, args);
     }};
+    const _origToBlob = HTMLCanvasElement.prototype.toBlob;
+    HTMLCanvasElement.prototype.toBlob = function(cb, ...args) {{
+        try {{
+            const ctx = this.getContext('2d');
+            if (ctx) {{
+                const d = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
+                _addCanvasNoise(d.data);
+                ctx.putImageData(d, 0, 0);
+            }}
+        }} catch(e) {{}}
+        return _origToBlob.call(this, cb, ...args);
+    }};
+
+    // --- 11. AudioContext fingerprint noise ---
+    const _origGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
+    AnalyserNode.prototype.getFloatFrequencyData = function(arr) {{
+        _origGetFloatFreq.call(this, arr);
+        for (let i = 0; i < arr.length; i += 7) arr[i] += 0.001 * ((_seed + i) % 3 - 1);
+    }};
+    const _origCreateOsc = AudioContext.prototype.createOscillator;
+    AudioContext.prototype.createOscillator = function() {{
+        const osc = _origCreateOsc.call(this);
+        const _origFreq = Object.getOwnPropertyDescriptor(OscillatorNode.prototype, 'frequency');
+        return osc;
+    }};
     """
