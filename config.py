@@ -10,7 +10,7 @@ class Config:
     VFS_EMAIL = os.getenv("VFS_EMAIL", "")
     VFS_PASSWORD = os.getenv("VFS_PASSWORD", "")
 
-    # Multi-account rotation (format: "email1:pass1;email2:pass2;email3:pass3")
+    # Multi-account: "email1:pass1:proxy1;email2:pass2:proxy2" or "email1:pass1;email2:pass2"
     _accounts_raw = os.getenv("VFS_ACCOUNTS", "")
     VFS_ACCOUNTS: list[dict] = []
 
@@ -18,13 +18,28 @@ class Config:
     def load_accounts(cls):
         cls.VFS_ACCOUNTS = []
         if cls._accounts_raw:
-            for pair in cls._accounts_raw.split(";"):
+            for i, pair in enumerate(cls._accounts_raw.split(";")):
                 pair = pair.strip()
-                if ":" in pair:
-                    email, pwd = pair.split(":", 1)
-                    cls.VFS_ACCOUNTS.append({"email": email.strip(), "password": pwd.strip()})
+                if not pair:
+                    continue
+                parts = pair.split(":", 2)
+                if len(parts) >= 2:
+                    email = parts[0].strip()
+                    pwd = parts[1].strip()
+                    proxy = parts[2].strip() if len(parts) > 2 else ""
+                    cls.VFS_ACCOUNTS.append({
+                        "email": email,
+                        "password": pwd,
+                        "proxy": proxy or cls.PROXY_URL,
+                        "index": i,
+                    })
         if not cls.VFS_ACCOUNTS and cls.VFS_EMAIL:
-            cls.VFS_ACCOUNTS.append({"email": cls.VFS_EMAIL, "password": cls.VFS_PASSWORD})
+            cls.VFS_ACCOUNTS.append({
+                "email": cls.VFS_EMAIL,
+                "password": cls.VFS_PASSWORD,
+                "proxy": cls.PROXY_URL,
+                "index": 0,
+            })
 
     # Параметры бронирования (точные значения из dropdown'ов)
     VFS_CENTRE = os.getenv("VFS_CENTRE", "VFS GLOBAL SERVICES UBKN")

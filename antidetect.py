@@ -15,19 +15,19 @@ from fingerprint import load_or_create_profile, build_stealth_script
 
 logger = logging.getLogger(__name__)
 
-_profile = None
+_profiles: dict[str, dict] = {}
 
 
-def get_profile() -> dict:
-    global _profile
-    if _profile is None:
-        _profile = load_or_create_profile()
-    return _profile
+def get_profile(profile_path: str = "") -> dict:
+    path = profile_path or "browser_profile.json"
+    if path not in _profiles:
+        _profiles[path] = load_or_create_profile(path)
+    return _profiles[path]
 
 
-async def setup_stealth_on_new_page(page) -> None:
+async def setup_stealth_on_new_page(page, profile_path: str = "") -> None:
     """Pre-navigation stealth via CDP addScriptToEvaluateOnNewDocument."""
-    profile = get_profile()
+    profile = get_profile(profile_path)
     script = build_stealth_script(profile)
 
     # Method 1: raw CDP command (works across nodriver versions)
@@ -68,9 +68,9 @@ async def setup_stealth_on_new_page(page) -> None:
         logger.error("ALL stealth injection failed: %s — browser is detectable!", e)
 
 
-def get_chrome_args() -> list[str]:
+def get_chrome_args(profile_path: str = "") -> list[str]:
     """Chrome args from persistent profile."""
-    profile = get_profile()
+    profile = get_profile(profile_path)
     width, height = profile["viewport"]
     return [
         f"--window-size={width},{height}",
@@ -94,7 +94,7 @@ def get_chrome_args() -> list[str]:
         "--disable-translate",
         "--metrics-recording-only",
         "--mute-audio",
-        "--renderer-process-limit=1",
+        "--renderer-process-limit=2",
         "--disable-background-timer-throttling",
         "--js-flags=--max-old-space-size=256",
     ]

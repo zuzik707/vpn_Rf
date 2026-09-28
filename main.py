@@ -188,6 +188,119 @@ def cleanup_screenshots() -> int:
     return removed
 
 
+async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
+                     stats: SessionStats, hot_mode_until_shared: dict):
+    """Single account worker — runs in its own Chrome instance."""
+    email = acct["email"]
+    proxy_url = acct.get("proxy", "")
+    tag = f"[W{worker_id}:{email.split('@')[0]}]"
+
+    checker = VFSBrowser(
+        captcha_solver=solver, email=email, password=acct["password"],
+        proxy_url=proxy_url, worker_id=worker_id,
+    )
+    consecutive_errors = 0
+    checks_since_login = 0
+
+    logger.info("%s Старт воркера (proxy=%s)", tag,
+                proxy_url.split("@")[-1] if "@" in proxy_url else (proxy_url[:30] or "none"))
+
+    # Stagger start: each worker waits worker_id * 15-30s to avoid simultaneous launches
+    if worker_id > 0:
+        stagger = worker_id * random.uniform(15, 30)
+        logger.info("%s Stagger start: %.0fс", tag, stagger)
+        await asyncio.sleep(stagger)
+
+    try:
+        stats.logins_total += 1
+        if not await checker.login():
+            stats.logins_failed += 1
+            logger.error("%s Первый логин не удался", tag)
+            await asyncio.to_thread(notify_error, f"{tag} Первый логин не удался. Проверь credentials.")
+        else:
+            logger.info("%s Логин OK", tag)
+
+        while running:
+            if is_quiet_hours():
+                await asyncio.sleep(600)
+                continue
+
+            if should_random_skip() and not hot_mode_until_shared.get("active"):
+                await asyncio.sleep(random.uniform(20, 60))
+                continue
+
+            stats.checks_total += 1
+            checks_since_login += 1
+            hot_now = hot_mode_until_shared.get("active", False)
+
+            logger.info("%s Проверка #%d | %s", tag, stats.checks_total,
+                        "HOT" if hot_now else ("день" if is_daytime() else "ночь"))
+
+            try:
+                if should_sign_out_cycle(checks_since_login) and not hot_now:
+                    logger.info("%s Sign out/in цикл", tag)
+                    await checker.close_browser()
+                    await asyncio.sleep(random.uniform(30, 90))
+                    checks_since_login = 0
+
+                if not checker.session_alive():
+                    logger.info("%s Сессия протухла — рестарт", tag)
+                    await checker.close_browser()
+                    await asyncio.sleep(random.uniform(5, 15))
+                    stats.logins_total += 1
+                    if not await checker.login():
+                        stats.logins_failed += 1
+                        raise RuntimeError(f"{tag} Перелогин не удался")
+                    checks_since_login = 0
+
+                found, info, screenshot = await checker.check_slots()
+
+                if found:
+                    stats.checks_success += 1
+                    stats.slots_found_count += 1
+                    logger.info("%s СЛОТЫ: %s", tag, info)
+                    await asyncio.to_thread(notify_slots_found, f"{tag}\n{info}", screenshot)
+                    hot_mode_until_shared["until"] = time.time() + Config.HOT_MODE_DURATION
+                    hot_mode_until_shared["active"] = True
+                    consecutive_errors = 0
+                else:
+                    stats.checks_success += 1
+                    consecutive_errors = 0
+
+            except Exception as e:
+                stats.checks_failed += 1
+                consecutive_errors += 1
+                logger.error("%s Ошибка #%d: %s", tag, consecutive_errors, e, exc_info=True)
+
+                if consecutive_errors == 3:
+                    await checker.close_browser()
+                    await asyncio.sleep(random.uniform(30, 60))
+
+                if consecutive_errors >= 5:
+                    await asyncio.to_thread(notify_error,
+                        f"{tag} 5 ошибок подряд: {e}")
+                    consecutive_errors = 0
+                    await checker.close_browser()
+                    await asyncio.sleep(random.uniform(300, 600))
+                    continue
+
+            sleep_time = get_sleep_interval(
+                consecutive_errors,
+                hot_mode_until_shared.get("active", False),
+                cf_backoff=checker.should_backoff,
+            )
+            logger.info("%s Сон %.0f сек", tag, sleep_time)
+            await asyncio.sleep(sleep_time)
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error("%s Worker crash: %s", tag, e, exc_info=True)
+    finally:
+        await checker.close_browser()
+        logger.info("%s Worker остановлен", tag)
+
+
 async def run_monitor():
     missing = validate_config()
     if missing:
@@ -212,7 +325,6 @@ async def run_monitor():
     else:
         logger.warning("Proxy не настроен — риск бана!")
 
-    # Проверяем баланс captcha
     from captcha_solver import CaptchaSolver
     try:
         solver = CaptchaSolver(budget)
@@ -223,7 +335,6 @@ async def run_monitor():
         logger.warning("Captcha check: %s", e)
         solver = CaptchaSolver(budget)
 
-    # Пробуем загрузить сохранённую статистику
     saved = load_session_state()
     stats = SessionStats()
     if saved:
@@ -232,188 +343,87 @@ async def run_monitor():
         logger.info("Восстановлена статистика: %d проверок, %d слотов",
                      stats.checks_total, stats.slots_found_count)
 
-    rotator = AccountRotator(Config.VFS_ACCOUNTS)
-    acct = rotator.current
-    checker = VFSBrowser(captcha_solver=solver, email=acct["email"], password=acct["password"])
-    consecutive_errors = 0
-    hot_mode_until = 0.0
-    last_heartbeat = time.time()
-    checks_since_login = 0
+    accounts = Config.VFS_ACCOUNTS
+    n = len(accounts)
+    mode = "parallel" if n > 1 else "single"
 
-    acct_info = f"Аккаунтов: {len(Config.VFS_ACCOUNTS)}, активный: {acct['email']}"
+    acct_list = ", ".join(a["email"] for a in accounts)
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
     await asyncio.to_thread(notify_status,
-        "Мониторинг запущен v4.0\n"
+        f"Мониторинг запущен v5.0 ({mode})\n"
         f"URL: {Config.VFS_URL}\n"
-        f"{acct_info}\n"
+        f"Аккаунтов: {n} | {acct_list}\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
         f"Ночь: {Config.CHECK_INTERVAL_NIGHT_MIN}-{Config.CHECK_INTERVAL_NIGHT_MAX}с\n"
         f"Timezone: UTC+{Config.TIMEZONE_OFFSET}\n"
-        "Stack: nodriver + HumanClicker + SessionWarmer + budget guard"
+        f"Stack: nodriver + HumanClicker + SessionWarmer + {n}x Chrome"
     )
 
-    try:
-        stats.logins_total += 1
-        if not await checker.login():
-            stats.logins_failed += 1
-            rotator.report_fail(acct["email"])
-            logger.error("Первый логин не удался (%s)", acct["email"])
-            if rotator.should_rotate(acct["email"]):
-                new_acct = rotator.rotate()
-                if new_acct:
-                    acct = new_acct
-                    checker.set_credentials(acct["email"], acct["password"])
-                    await checker.close_browser()
-            await asyncio.to_thread(notify_error, f"Первый логин не удался ({acct['email']}). Проверь credentials.")
-        else:
-            rotator.report_success(acct["email"])
-            logger.info("Первый логин OK (%s)", acct["email"])
+    hot_mode_shared = {"until": 0.0, "active": False}
 
+    # Heartbeat task
+    async def heartbeat_loop():
+        last_hb = time.time()
         while running:
-            # Тихие часы
-            if is_quiet_hours():
-                logger.debug("Тихие часы (%02d:00 local)", local_hour())
-                await asyncio.sleep(600)
-                continue
-
-            # Heartbeat
-            if time.time() - last_heartbeat >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
+            await asyncio.sleep(60)
+            if time.time() - last_hb >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
+                # Update hot mode state
+                if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
+                    hot_mode_shared["active"] = False
+                    await asyncio.to_thread(notify_status, "Hot mode закончился — слоты разобрали")
                 proxy_info = (await asyncio.to_thread(proxy.stats_text)) if proxy.is_configured else "Proxy: не настроен"
-                heartbeat_msg = (
+                hb = (
                     f"Heartbeat | {stats.summary()}\n"
                     f"{budget.stats_text()}\n"
                     f"{proxy_info}\n"
-                    f"Режим: {'день' if is_daytime() else 'ночь'} | "
-                    f"Hot: {'да' if time.time() < hot_mode_until else 'нет'}"
+                    f"Workers: {n} | Режим: {'день' if is_daytime() else 'ночь'} | "
+                    f"Hot: {'да' if hot_mode_shared['active'] else 'нет'}"
                 )
-                await asyncio.to_thread(notify_status, heartbeat_msg)
-                last_heartbeat = time.time()
+                await asyncio.to_thread(notify_status, hb)
+                last_hb = time.time()
                 cleanup_screenshots()
                 try:
                     from dom_dumper import cleanup_dumps
                     cleanup_dumps()
                 except Exception:
                     pass
+                await asyncio.to_thread(save_session_state, {
+                    "checks_total": stats.checks_total,
+                    "slots_found_count": stats.slots_found_count,
+                    "logins_total": stats.logins_total,
+                })
 
-            # Random skip — как нерегулярный пользователь
-            if should_random_skip() and not (time.time() < hot_mode_until):
-                logger.info("Random skip — пропускаем проверку")
-                await asyncio.sleep(random.uniform(20, 60))
-                continue
+    tasks = []
+    try:
+        tasks.append(asyncio.create_task(heartbeat_loop()))
+        for i, acct in enumerate(accounts):
+            t = asyncio.create_task(
+                run_worker(i, acct, solver, budget, stats, hot_mode_shared))
+            tasks.append(t)
 
-            stats.checks_total += 1
-            checks_since_login += 1
-            was_hot = hot_mode_until > 0
-            hot_now = time.time() < hot_mode_until
-            if was_hot and not hot_now:
-                await asyncio.to_thread(notify_status, "Hot mode закончился — слоты разобрали")
-                hot_mode_until = 0.0
-            logger.info("--- Проверка #%d | %s | %s ---",
-                        stats.checks_total,
-                        "HOT" if hot_now else ("день" if is_daytime() else "ночь"),
-                        stats.summary())
-
-            try:
-                # Периодический sign out/in цикл
-                if should_sign_out_cycle(checks_since_login) and not hot_now:
-                    logger.info("Sign out/in цикл (checks_since_login=%d)", checks_since_login)
-                    await checker.close_browser()
-                    await asyncio.sleep(random.uniform(30, 90))
-                    checks_since_login = 0
-
-                if not checker.session_alive():
-                    logger.info("Сессия протухла — рестарт (%s)", acct["email"])
-                    await checker.close_browser()
-                    await asyncio.sleep(random.uniform(5, 15))
-                    stats.logins_total += 1
-                    if not await checker.login():
-                        stats.logins_failed += 1
-                        rotator.report_fail(acct["email"])
-                        if rotator.should_rotate(acct["email"]):
-                            new_acct = rotator.rotate()
-                            if new_acct:
-                                acct = new_acct
-                                checker.set_credentials(acct["email"], acct["password"])
-                                await asyncio.to_thread(notify_status,
-                                    f"Ротация аккаунта → {acct['email']}")
-                        raise RuntimeError("Перелогин не удался")
-                    checks_since_login = 0
-
-                found, info, screenshot = await checker.check_slots()
-
-                if found:
-                    stats.checks_success += 1
-                    stats.slots_found_count += 1
-                    rotator.report_success(acct["email"])
-                    logger.info("СЛОТЫ: %s", info)
-                    await asyncio.to_thread(notify_slots_found, info, screenshot)
-                    hot_mode_until = time.time() + Config.HOT_MODE_DURATION
-                    consecutive_errors = 0
-                else:
-                    stats.checks_success += 1
-                    rotator.report_success(acct["email"])
-                    consecutive_errors = 0
-
-            except Exception as e:
-                stats.checks_failed += 1
-                consecutive_errors += 1
-                rotator.report_fail(acct["email"])
-                logger.error("Ошибка #%d (%s): %s", consecutive_errors, acct["email"], e, exc_info=True)
-
-                if consecutive_errors == 3:
-                    logger.info("3 ошибки подряд — полный рестарт")
-                    if proxy.is_configured:
-                        new_ip = await asyncio.to_thread(proxy.rotate_ip)
-                        if new_ip:
-                            logger.info("IP ротация после ошибок: %s", new_ip)
-                    if rotator.should_rotate(acct["email"]):
-                        new_acct = rotator.rotate()
-                        if new_acct:
-                            acct = new_acct
-                            checker.set_credentials(acct["email"], acct["password"])
-                            await asyncio.to_thread(notify_status,
-                                f"Ротация аккаунта → {acct['email']}")
-                    await checker.close_browser()
-                    await asyncio.sleep(random.uniform(30, 60))
-
-                if consecutive_errors >= 5:
-                    await asyncio.to_thread(notify_error, f"5 ошибок подряд ({acct['email']}): {e}\n{stats.summary()}")
-                    consecutive_errors = 0
-                    await checker.close_browser()
-                    await asyncio.sleep(random.uniform(300, 600))
-                    continue
-
-            # Сохраняем статистику
-            await asyncio.to_thread(save_session_state, {
-                "checks_total": stats.checks_total,
-                "slots_found_count": stats.slots_found_count,
-                "logins_total": stats.logins_total,
-            })
-
-            sleep_time = get_sleep_interval(
-                consecutive_errors,
-                time.time() < hot_mode_until,
-                cf_backoff=checker.should_backoff,
-            )
-            logger.info("Сон %.0f сек (%s)", sleep_time,
-                        "hot" if time.time() < hot_mode_until else
-                        "день" if is_daytime() else "ночь")
-            await asyncio.sleep(sleep_time)
-
+        # Wait until signal or all workers die
+        done, pending = await asyncio.wait(
+            tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for t in done:
+            if t.exception() and not isinstance(t.exception(), asyncio.CancelledError):
+                logger.error("Task died: %s", t.exception())
     except KeyboardInterrupt:
         pass
     finally:
-        await checker.close_browser()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("Стоп. %s", stats.summary())
-        await asyncio.to_thread(notify_status, f"Мониторинг остановлен\n{stats.summary()}\n{budget.stats_text()}")
+        await asyncio.to_thread(notify_status,
+            f"Мониторинг остановлен\n{stats.summary()}\n{budget.stats_text()}")
 
 
 def main():
     print("""
- ╔═══════════════════════════════════════════════╗
- ║   VFS Global Slot Detector v4.0               ║
- ║   UZB → LVA | HumanClicker + SessionWarmer   ║
- ╚═══════════════════════════════════════════════╝
+ ╔═══════════════════════════════════════════════════════╗
+ ║   VFS Global Slot Detector v5.0                       ║
+ ║   UZB → LVA | Parallel Multi-Account + HumanClicker  ║
+ ╚═══════════════════════════════════════════════════════╝
     """)
     asyncio.run(run_monitor())
 

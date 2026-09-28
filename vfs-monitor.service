@@ -13,10 +13,10 @@ RestartSec=60
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
-# 1 CPU / 1 GB RAM VPS
-MemoryMax=750M
-MemoryHigh=600M
-CPUQuota=90%
+# 4 CPU / 4 GB RAM VPS — parallel multi-account
+MemoryMax=3500M
+MemoryHigh=3000M
+CPUQuota=350%
 LimitNOFILE=4096
 
 # Logging

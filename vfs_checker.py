@@ -66,16 +66,22 @@ BLOCKED_MARKERS = [
 ]
 
 
-COOKIES_PATH = "cookies.json"
-
-
 class VFSBrowser:
-    def __init__(self, captcha_solver=None, email: str = "", password: str = ""):
+    def __init__(self, captcha_solver=None, email: str = "", password: str = "",
+                 proxy_url: str = "", worker_id: int = 0):
         self.browser: uc.Browser | None = None
         self.page: uc.Tab | None = None
         self.captcha_solver = captcha_solver
         self.email = email or Config.VFS_EMAIL
         self.password = password or Config.VFS_PASSWORD
+        self.proxy_url = proxy_url or Config.PROXY_URL
+        self.worker_id = worker_id
+        self._browser_data_dir = os.path.join(
+            os.path.dirname(__file__), f"browser_data_{worker_id}")
+        self._cookies_path = os.path.join(
+            os.path.dirname(__file__), f"cookies_{worker_id}.json")
+        self._profile_path = os.path.join(
+            os.path.dirname(__file__), f"browser_profile_{worker_id}.json")
         self.interceptor = NetworkInterceptor()
         self.hc: HumanClicker | None = None
         self.warmer: SessionWarmer | None = None
@@ -92,31 +98,32 @@ class VFSBrowser:
     # ── Browser lifecycle ──────────────────────────────────────────
 
     async def start_browser(self) -> None:
-        os.makedirs(Config.BROWSER_DATA_DIR, exist_ok=True)
+        os.makedirs(self._browser_data_dir, exist_ok=True)
         os.makedirs(Config.SCREENSHOT_DIR, exist_ok=True)
         for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            lock_path = os.path.join(Config.BROWSER_DATA_DIR, lock)
+            lock_path = os.path.join(self._browser_data_dir, lock)
             if os.path.exists(lock_path):
                 try:
                     os.remove(lock_path)
                 except OSError:
                     pass
-        args = get_chrome_args()
+        args = get_chrome_args(self._profile_path)
         self._proxy_auth = None
-        if Config.PROXY_URL:
-            proxy_for_chrome, self._proxy_auth = self._parse_proxy_url(Config.PROXY_URL)
+        if self.proxy_url:
+            proxy_for_chrome, self._proxy_auth = self._parse_proxy_url(self.proxy_url)
             args.append(f"--proxy-server={proxy_for_chrome}")
-            logger.info("Proxy: %s", proxy_for_chrome.split("@")[-1] if "@" in proxy_for_chrome else proxy_for_chrome)
+            logger.info("[W%d] Proxy: %s", self.worker_id,
+                        proxy_for_chrome.split("@")[-1] if "@" in proxy_for_chrome else proxy_for_chrome)
         has_display = bool(os.environ.get("DISPLAY"))
         if not has_display:
             logger.warning("No DISPLAY — using headless='new'. For best results: apt install xvfb && xvfb-run python main.py")
         self.browser = await uc.start(
-            user_data_dir=Config.BROWSER_DATA_DIR,
+            user_data_dir=self._browser_data_dir,
             headless="new" if not has_display else False,
             lang="en-US",
             browser_args=args,
         )
-        logger.info("Chrome запущен (nodriver, headless=%s)", "new" if not has_display else "False")
+        logger.info("[W%d] Chrome запущен (%s)", self.worker_id, self.email)
 
     @staticmethod
     def _parse_proxy_url(url: str) -> tuple[str, tuple[str, str] | None]:
@@ -190,19 +197,19 @@ class VFSBrowser:
                     "path": c.path, "expires": c.expires, "httpOnly": c.http_only,
                     "secure": c.secure, "sameSite": c.same_site.value if c.same_site else None,
                 })
-            with open(COOKIES_PATH, "w") as f:
+            with open(self._cookies_path, "w") as f:
                 json.dump(serializable, f)
-            os.chmod(COOKIES_PATH, 0o600)
+            os.chmod(self._cookies_path, 0o600)
             logger.debug("Saved %d cookies", len(serializable))
         except Exception as e:
             logger.debug("Cookie save failed: %s", e)
 
     async def _restore_cookies(self) -> None:
-        if not self.page or not os.path.exists(COOKIES_PATH):
+        if not self.page or not os.path.exists(self._cookies_path):
             return
         try:
             import nodriver.cdp.network as net_cdp
-            with open(COOKIES_PATH) as f:
+            with open(self._cookies_path) as f:
                 cookies = json.load(f)
             for c in cookies:
                 try:
@@ -230,11 +237,10 @@ class VFSBrowser:
                     await result
             except Exception:
                 pass
-            # Kill any zombie chrome processes from this user data dir
             try:
                 import subprocess
                 subprocess.run(
-                    ["pkill", "-f", f"chrome.*{Config.BROWSER_DATA_DIR}"],
+                    ["pkill", "-f", f"chrome.*{self._browser_data_dir}"],
                     capture_output=True, timeout=5,
                 )
             except Exception:
@@ -782,7 +788,7 @@ class VFSBrowser:
             except Exception:
                 pass
         self.page = await self.browser.get("about:blank")
-        await setup_stealth_on_new_page(self.page)
+        await setup_stealth_on_new_page(self.page, self._profile_path)
         try:
             import nodriver.cdp.emulation as emu_cdp
             await self.page.send(emu_cdp.set_timezone_override(timezone_id="Asia/Tashkent"))
