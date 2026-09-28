@@ -843,6 +843,13 @@ class VFSBrowser:
             state = await self._page_state()
             logger.info("State: %s (attempt %d)", state, attempt + 1)
 
+            if state == "unknown" and attempt == 0:
+                url = await self._url()
+                text = await self._text()
+                logger.info("DEBUG unknown — URL: %s", url[:200])
+                logger.info("DEBUG unknown — text: %s", text[:300])
+                await self._screenshot("state_unknown")
+
             if state == "blocked":
                 await self._screenshot("blocked")
                 return False
