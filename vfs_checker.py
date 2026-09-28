@@ -1052,7 +1052,13 @@ class VFSBrowser:
                 await self.page.close()
             except Exception:
                 pass
-        self.page = await self.browser.get("about:blank")
+        try:
+            self.page = await self.browser.get("about:blank")
+        except Exception as e:
+            logger.warning("Browser connection lost (%s) — restarting", e)
+            await self.close_browser()
+            await self.start_browser()
+            self.page = await self.browser.get("about:blank")
         await setup_stealth_on_new_page(self.page, self._profile_path)
         try:
             import nodriver.cdp.emulation as emu_cdp
