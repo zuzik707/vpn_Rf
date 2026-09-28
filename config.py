@@ -10,6 +10,22 @@ class Config:
     VFS_EMAIL = os.getenv("VFS_EMAIL", "")
     VFS_PASSWORD = os.getenv("VFS_PASSWORD", "")
 
+    # Multi-account rotation (format: "email1:pass1;email2:pass2;email3:pass3")
+    _accounts_raw = os.getenv("VFS_ACCOUNTS", "")
+    VFS_ACCOUNTS: list[dict] = []
+
+    @classmethod
+    def load_accounts(cls):
+        cls.VFS_ACCOUNTS = []
+        if cls._accounts_raw:
+            for pair in cls._accounts_raw.split(";"):
+                pair = pair.strip()
+                if ":" in pair:
+                    email, pwd = pair.split(":", 1)
+                    cls.VFS_ACCOUNTS.append({"email": email.strip(), "password": pwd.strip()})
+        if not cls.VFS_ACCOUNTS and cls.VFS_EMAIL:
+            cls.VFS_ACCOUNTS.append({"email": cls.VFS_EMAIL, "password": cls.VFS_PASSWORD})
+
     # Параметры бронирования (точные значения из dropdown'ов)
     VFS_CENTRE = os.getenv("VFS_CENTRE", "VFS GLOBAL SERVICES UBKN")
     VFS_CATEGORY = os.getenv("VFS_CATEGORY", "Latvia Long Stay/Visa D")
@@ -62,3 +78,6 @@ class Config:
 
     BROWSER_DATA_DIR = os.path.join(os.path.dirname(__file__), "browser_data")
     SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "screenshots")
+
+
+Config.load_accounts()

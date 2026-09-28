@@ -70,10 +70,12 @@ COOKIES_PATH = "cookies.json"
 
 
 class VFSBrowser:
-    def __init__(self, captcha_solver=None):
+    def __init__(self, captcha_solver=None, email: str = "", password: str = ""):
         self.browser: uc.Browser | None = None
         self.page: uc.Tab | None = None
         self.captcha_solver = captcha_solver
+        self.email = email or Config.VFS_EMAIL
+        self.password = password or Config.VFS_PASSWORD
         self.interceptor = NetworkInterceptor()
         self.hc: HumanClicker | None = None
         self.warmer: SessionWarmer | None = None
@@ -82,6 +84,10 @@ class VFSBrowser:
         self.last_login_time: float = 0
         self._session_ttl: float = random.uniform(1500, 2400)
         self.cf_fail_count: int = 0
+
+    def set_credentials(self, email: str, password: str) -> None:
+        self.email = email
+        self.password = password
 
     # ── Browser lifecycle ──────────────────────────────────────────
 
@@ -858,7 +864,7 @@ class VFSBrowser:
                 else:
                     await email_el.click()
                 await self._delay(0.3, 0.6)
-                await self._human_type(email_el, Config.VFS_EMAIL)
+                await self._human_type(email_el, self.email)
                 await self._delay(0.6, 1.2)
 
                 # Реальный password: #password (не #password1 — honeypot!)
@@ -876,7 +882,7 @@ class VFSBrowser:
                 else:
                     await pwd_el.click()
                 await self._delay(0.3, 0.6)
-                await self._human_type(pwd_el, Config.VFS_PASSWORD)
+                await self._human_type(pwd_el, self.password)
                 await self._delay(0.6, 1.2)
 
                 # Может быть captcha на форме логина

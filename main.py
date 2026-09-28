@@ -32,6 +32,52 @@ from notifier import notify_error, notify_slots_found, notify_status
 from session_manager import SessionStats, save_session_state, load_session_state
 from vfs_checker import VFSBrowser
 
+
+class AccountRotator:
+    """Rotates VFS accounts on consecutive failures/bans."""
+
+    MAX_FAILS = 3
+    COOLDOWN = 1800  # 30 min cooldown for banned accounts
+
+    def __init__(self, accounts: list[dict]):
+        self.accounts = accounts
+        self.index = 0
+        self.fails: dict[str, int] = {}
+        self.cooldowns: dict[str, float] = {}
+
+    @property
+    def current(self) -> dict:
+        return self.accounts[self.index]
+
+    def report_fail(self, email: str) -> None:
+        self.fails[email] = self.fails.get(email, 0) + 1
+
+    def report_success(self, email: str) -> None:
+        self.fails[email] = 0
+
+    def should_rotate(self, email: str) -> bool:
+        return self.fails.get(email, 0) >= self.MAX_FAILS
+
+    def rotate(self) -> dict | None:
+        if len(self.accounts) <= 1:
+            return None
+        self.cooldowns[self.current["email"]] = time.time()
+        original = self.index
+        for _ in range(len(self.accounts)):
+            self.index = (self.index + 1) % len(self.accounts)
+            acct = self.accounts[self.index]
+            cd = self.cooldowns.get(acct["email"], 0)
+            if time.time() - cd >= self.COOLDOWN:
+                logging.getLogger(__name__).info(
+                    "Account rotation: %s → %s",
+                    self.accounts[original]["email"],
+                    acct["email"],
+                )
+                return acct
+        self.index = (original + 1) % len(self.accounts)
+        logging.getLogger(__name__).warning("All accounts on cooldown, using %s", self.current["email"])
+        return self.current
+
 from logging.handlers import RotatingFileHandler
 
 logging.basicConfig(
@@ -79,8 +125,11 @@ def is_daytime() -> bool:
 
 def validate_config() -> list[str]:
     missing = []
-    for var in ("VFS_EMAIL", "VFS_PASSWORD", "CAPTCHA_API_KEY",
-                "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+    if not Config.VFS_ACCOUNTS:
+        for var in ("VFS_EMAIL", "VFS_PASSWORD"):
+            if not getattr(Config, var, ""):
+                missing.append(var)
+    for var in ("CAPTCHA_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
         if not getattr(Config, var, ""):
             missing.append(var)
     return missing
@@ -183,16 +232,20 @@ async def run_monitor():
         logger.info("Восстановлена статистика: %d проверок, %d слотов",
                      stats.checks_total, stats.slots_found_count)
 
-    checker = VFSBrowser(captcha_solver=solver)
+    rotator = AccountRotator(Config.VFS_ACCOUNTS)
+    acct = rotator.current
+    checker = VFSBrowser(captcha_solver=solver, email=acct["email"], password=acct["password"])
     consecutive_errors = 0
     hot_mode_until = 0.0
     last_heartbeat = time.time()
     checks_since_login = 0
 
+    acct_info = f"Аккаунтов: {len(Config.VFS_ACCOUNTS)}, активный: {acct['email']}"
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
     await asyncio.to_thread(notify_status,
         "Мониторинг запущен v4.0\n"
         f"URL: {Config.VFS_URL}\n"
+        f"{acct_info}\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
         f"Ночь: {Config.CHECK_INTERVAL_NIGHT_MIN}-{Config.CHECK_INTERVAL_NIGHT_MAX}с\n"
         f"Timezone: UTC+{Config.TIMEZONE_OFFSET}\n"
@@ -203,10 +256,18 @@ async def run_monitor():
         stats.logins_total += 1
         if not await checker.login():
             stats.logins_failed += 1
-            logger.error("Первый логин не удался")
-            await asyncio.to_thread(notify_error, "Первый логин не удался. Проверь VFS_EMAIL/VFS_PASSWORD.")
+            rotator.report_fail(acct["email"])
+            logger.error("Первый логин не удался (%s)", acct["email"])
+            if rotator.should_rotate(acct["email"]):
+                new_acct = rotator.rotate()
+                if new_acct:
+                    acct = new_acct
+                    checker.set_credentials(acct["email"], acct["password"])
+                    await checker.close_browser()
+            await asyncio.to_thread(notify_error, f"Первый логин не удался ({acct['email']}). Проверь credentials.")
         else:
-            logger.info("Первый логин OK")
+            rotator.report_success(acct["email"])
+            logger.info("Первый логин OK (%s)", acct["email"])
 
         while running:
             # Тихие часы
@@ -261,12 +322,20 @@ async def run_monitor():
                     checks_since_login = 0
 
                 if not checker.session_alive():
-                    logger.info("Сессия протухла — рестарт")
+                    logger.info("Сессия протухла — рестарт (%s)", acct["email"])
                     await checker.close_browser()
                     await asyncio.sleep(random.uniform(5, 15))
                     stats.logins_total += 1
                     if not await checker.login():
                         stats.logins_failed += 1
+                        rotator.report_fail(acct["email"])
+                        if rotator.should_rotate(acct["email"]):
+                            new_acct = rotator.rotate()
+                            if new_acct:
+                                acct = new_acct
+                                checker.set_credentials(acct["email"], acct["password"])
+                                await asyncio.to_thread(notify_status,
+                                    f"Ротация аккаунта → {acct['email']}")
                         raise RuntimeError("Перелогин не удался")
                     checks_since_login = 0
 
@@ -275,31 +344,40 @@ async def run_monitor():
                 if found:
                     stats.checks_success += 1
                     stats.slots_found_count += 1
+                    rotator.report_success(acct["email"])
                     logger.info("СЛОТЫ: %s", info)
                     await asyncio.to_thread(notify_slots_found, info, screenshot)
                     hot_mode_until = time.time() + Config.HOT_MODE_DURATION
                     consecutive_errors = 0
                 else:
                     stats.checks_success += 1
+                    rotator.report_success(acct["email"])
                     consecutive_errors = 0
 
             except Exception as e:
                 stats.checks_failed += 1
                 consecutive_errors += 1
-                logger.error("Ошибка #%d: %s", consecutive_errors, e, exc_info=True)
+                rotator.report_fail(acct["email"])
+                logger.error("Ошибка #%d (%s): %s", consecutive_errors, acct["email"], e, exc_info=True)
 
                 if consecutive_errors == 3:
                     logger.info("3 ошибки подряд — полный рестарт")
-                    # Ротация IP при повторных ошибках
                     if proxy.is_configured:
                         new_ip = await asyncio.to_thread(proxy.rotate_ip)
                         if new_ip:
                             logger.info("IP ротация после ошибок: %s", new_ip)
+                    if rotator.should_rotate(acct["email"]):
+                        new_acct = rotator.rotate()
+                        if new_acct:
+                            acct = new_acct
+                            checker.set_credentials(acct["email"], acct["password"])
+                            await asyncio.to_thread(notify_status,
+                                f"Ротация аккаунта → {acct['email']}")
                     await checker.close_browser()
                     await asyncio.sleep(random.uniform(30, 60))
 
                 if consecutive_errors >= 5:
-                    await asyncio.to_thread(notify_error, f"5 ошибок подряд: {e}\n{stats.summary()}")
+                    await asyncio.to_thread(notify_error, f"5 ошибок подряд ({acct['email']}): {e}\n{stats.summary()}")
                     consecutive_errors = 0
                     await checker.close_browser()
                     await asyncio.sleep(random.uniform(300, 600))
