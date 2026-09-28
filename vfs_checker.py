@@ -34,7 +34,7 @@ from config import Config
 from dom_dumper import dump_page
 from human_clicker import HumanClicker
 from network_interceptor import NetworkInterceptor
-from proxy_auth_helper import setup_proxy_auth_extension
+from local_proxy import start_local_proxy, get_local_proxy_url, DEFAULT_PORT
 from session_warmer import SessionWarmer
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,7 @@ class VFSBrowser:
         self._profile_path = os.path.join(
             os.path.dirname(__file__), f"browser_profile_{worker_id}.json")
         self.interceptor = NetworkInterceptor()
+        self._local_proxy_server: asyncio.Server | None = None
         self.hc: HumanClicker | None = None
         self.warmer: SessionWarmer | None = None
         self.logged_in = False
@@ -168,13 +169,17 @@ class VFSBrowser:
         self._proxy_auth = None
         if self.proxy_url:
             proxy_for_chrome, self._proxy_auth = self._parse_proxy_url(self.proxy_url)
-            args.append(f"--proxy-server={proxy_for_chrome}")
             if self._proxy_auth:
-                ext_path = setup_proxy_auth_extension(self._proxy_auth[0], self._proxy_auth[1])
-                args.append(f"--load-extension={ext_path}")
-                logger.info("[W%d] Proxy auth via Chrome extension", self.worker_id)
-            logger.info("[W%d] Proxy: %s", self.worker_id,
-                        proxy_for_chrome.split("@")[-1] if "@" in proxy_for_chrome else proxy_for_chrome)
+                local_port = DEFAULT_PORT + self.worker_id
+                if not self._local_proxy_server:
+                    self._local_proxy_server = await start_local_proxy(self.proxy_url, local_port)
+                chrome_proxy = f"http://127.0.0.1:{local_port}"
+                args.append(f"--proxy-server={chrome_proxy}")
+                logger.info("[W%d] Proxy via local bridge: %s → %s",
+                            self.worker_id, chrome_proxy, proxy_for_chrome)
+            else:
+                args.append(f"--proxy-server={proxy_for_chrome}")
+                logger.info("[W%d] Proxy (direct): %s", self.worker_id, proxy_for_chrome)
         has_display = bool(os.environ.get("DISPLAY"))
         if not has_display:
             logger.warning("No DISPLAY — using headless='new'. For best results: apt install xvfb && xvfb-run python main.py")
@@ -200,7 +205,7 @@ class VFSBrowser:
         return clean, auth
 
     async def _setup_proxy_auth(self, page, username: str, password: str) -> None:
-        """No-op — proxy auth now handled by Chrome extension."""
+        """No-op — proxy auth handled by local proxy bridge."""
         pass
 
     async def _save_cookies(self) -> None:
@@ -249,6 +254,9 @@ class VFSBrowser:
     async def close_browser(self) -> None:
         await self._save_cookies()
         await self.interceptor.detach()
+        if self._local_proxy_server:
+            self._local_proxy_server.close()
+            self._local_proxy_server = None
         if self.browser:
             try:
                 result = self.browser.stop()
