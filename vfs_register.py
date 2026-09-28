@@ -239,32 +239,53 @@ class VFSRegistrar:
             await self._delay(0.5, 1.0)
 
             # Заполняем Dial Code — кликаем mat-select чтобы открыть dropdown
+            # Используем mousedown+mouseup для Angular Material
             await self.page.evaluate("""
                 (() => {
                     const sel = document.querySelector('mat-select[formcontrolname="dialcode"]');
-                    if (sel) sel.click();
+                    if (!sel) return;
+                    const trigger = sel.querySelector('.mat-mdc-select-trigger') || sel;
+                    trigger.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                    trigger.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                    trigger.click();
                 })()
             """)
 
-            await self._delay(0.8, 1.2)
+            await self._delay(1.5, 2.5)
 
-            # Ищем +998 в overlay
-            code_js = _js_str(dial_code)
-            await self.page.evaluate(f"""
-                (() => {{
-                    const code = {code_js};
-                    const opts = document.querySelectorAll('mat-option, .mat-mdc-option');
-                    for (const opt of opts) {{
-                        if (opt.textContent.includes(code)) {{
-                            opt.click();
-                            return true;
+            # Ищем Uzbekistan(998) в overlay — формат: "Uzbekistan(998)", без +
+            # dial_code = "+998", ищем по "998" и "Uzbekistan"
+            code_num = dial_code.lstrip("+")
+            code_num_js = _js_str(code_num)
+            dial_selected = False
+            for _attempt in range(3):
+                dial_selected = await self.page.evaluate(f"""
+                    (() => {{
+                        const code = {code_num_js};
+                        const opts = document.querySelectorAll('mat-option, .mat-mdc-option, [role="option"]');
+                        for (const opt of opts) {{
+                            const t = opt.textContent;
+                            if (t.includes('(' + code + ')') || t.includes(code)) {{
+                                opt.click();
+                                return true;
+                            }}
                         }}
-                    }}
-                    const backdrop = document.querySelector('.cdk-overlay-backdrop');
-                    if (backdrop) backdrop.click();
-                    return false;
-                }})()
-            """)
+                        return false;
+                    }})()
+                """)
+                if dial_selected:
+                    break
+                await self._delay(0.5, 1.0)
+
+            if not dial_selected:
+                # Закрыть overlay если открыт
+                await self.page.evaluate("""
+                    (() => {
+                        const backdrop = document.querySelector('.cdk-overlay-backdrop');
+                        if (backdrop) backdrop.click();
+                    })()
+                """)
+                logger.warning("Dial code +998 not found in dropdown")
 
             await self._delay(0.5, 0.8)
 
@@ -289,16 +310,18 @@ class VFSRegistrar:
 
             await self._delay(0.5, 1.0)
 
-            # Ставим все 3 чекбокса
+            # Ставим все 3 чекбокса — кликаем внутренний input напрямую
             for cb_name in ['processPerDataAgreed', 'intTransPerDataAgreed', 'termAndConditionAgreed']:
                 await self.page.evaluate(f"""
                     (() => {{
                         const cb = document.querySelector('mat-checkbox[formcontrolname="{cb_name}"]');
-                        if (cb) {{
-                            const inner = cb.querySelector('input[type="checkbox"]');
-                            if (inner && !inner.checked) {{
-                                cb.click();
-                            }}
+                        if (!cb) return;
+                        const inner = cb.querySelector('input[type="checkbox"]');
+                        if (inner && !inner.checked) {{
+                            inner.focus();
+                            inner.click();
+                            inner.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            cb.dispatchEvent(new Event('change', {{bubbles: true}}));
                         }}
                     }})()
                 """)
@@ -332,8 +355,8 @@ class VFSRegistrar:
             """)
             logger.info("Form diagnostics: %s", diag)
 
-            # Ждём Turnstile
-            for _ in range(10):
+            # Ждём Turnstile (до 30 сек)
+            for _ in range(15):
                 token_ok = await self.page.evaluate("""
                     (() => {
                         const el = document.querySelector('[name="cf-turnstile-response"]');

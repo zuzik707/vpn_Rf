@@ -4,6 +4,7 @@
 """
 
 import logging
+import random
 import re
 import time
 
@@ -12,6 +13,34 @@ import requests
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.mail.tm"
+
+_FIRST_NAMES = [
+    "anna", "maria", "elena", "olga", "nina", "diana", "alina", "daria",
+    "ivan", "alex", "dmitry", "artem", "nikita", "sergey", "pavel", "denis",
+    "kamila", "aziza", "nodira", "dilnoza", "jasur", "bobur", "sardor", "timur",
+    "kate", "julia", "lena", "max", "daniel", "mark", "lucas", "emma",
+]
+_LAST_NAMES = [
+    "kim", "lee", "park", "chen", "wang", "khan", "ali", "ahmed",
+    "smith", "jones", "miller", "davis", "wilson", "taylor", "moore", "clark",
+    "karimov", "aliev", "umarov", "nazarov", "rashidov", "sultanov",
+]
+
+
+def _random_human_prefix() -> str:
+    first = random.choice(_FIRST_NAMES)
+    last = random.choice(_LAST_NAMES)
+    sep = random.choice([".", "_", ""])
+    num = random.randint(1, 99)
+    style = random.randint(0, 3)
+    if style == 0:
+        return f"{first}{sep}{last}{num}"
+    elif style == 1:
+        return f"{last}{sep}{first}{num}"
+    elif style == 2:
+        return f"{first}{num}{sep}{last}"
+    else:
+        return f"{first}{sep}{last}"
 
 
 class TempMailClient:
@@ -40,7 +69,7 @@ class TempMailClient:
         domain = active[0]["domain"]
 
         if not prefix:
-            prefix = f"vfs{int(time.time())}"
+            prefix = _random_human_prefix()
         # Убираем спецсимволы из prefix
         prefix = re.sub(r'[^a-z0-9._-]', '', prefix.lower())
 
