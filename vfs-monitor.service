@@ -1,5 +1,5 @@
 [Unit]
-Description=VFS Global Slot Detector
+Description=VFS Global Slot Detector v4.0 (UZB→LVA)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,18 +7,26 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/root/vpn_Rf
-ExecStart=/usr/bin/xvfb-run /root/vpn_Rf/venv/bin/python /root/vpn_Rf/main.py
+ExecStart=/usr/bin/xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24 -nolisten tcp" /root/vfs_venv/bin/python3 /root/vpn_Rf/main.py
 Restart=always
-RestartSec=30
-Environment=DISPLAY=:99
+RestartSec=60
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
-# Логи
-StandardOutput=journal
-StandardError=journal
+# 1 CPU / 1 GB RAM VPS
+MemoryMax=750M
+MemoryHigh=600M
+CPUQuota=90%
+LimitNOFILE=4096
 
-# Лимиты
-LimitNOFILE=65536
-MemoryMax=2G
+# Logging
+StandardOutput=append:/root/vpn_Rf/vfs_monitor.log
+StandardError=append:/root/vpn_Rf/vfs_monitor.log
+
+# Kill Chrome properly
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
