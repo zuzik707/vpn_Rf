@@ -348,8 +348,9 @@ class VFSBrowser:
         path = os.path.join(Config.SCREENSHOT_DIR, f"{tag}_{int(time.time())}.png")
         try:
             await self.page.save_screenshot(path)
-        except Exception:
-            pass
+            logger.info("Screenshot: %s", path)
+        except Exception as e:
+            logger.debug("Screenshot failed (%s): %s", tag, e)
         return path
 
     async def _url(self) -> str:
@@ -668,6 +669,17 @@ class VFSBrowser:
             return False
 
     async def _solve_turnstile(self) -> bool:
+        # Check if Turnstile already solved itself (managed/invisible mode)
+        token_exists = await self.page.evaluate("""
+            (() => {
+                const el = document.querySelector('[name="cf-turnstile-response"]');
+                return el && el.value && el.value.length > 20;
+            })()
+        """)
+        if token_exists:
+            logger.info("Turnstile токен уже заполнен — пропускаем решение")
+            return True
+
         if await self._try_turnstile_click():
             return True
 
@@ -1173,12 +1185,21 @@ class VFSBrowser:
                 await self._human_type(pwd_el, self.password)
                 await self._delay(0.6, 1.2)
 
-                # Может быть captcha на форме логина
-                html = await self._html()
-                if any(m in html for m in CAPTCHA_MARKERS):
-                    logger.info("CAPTCHA на форме логина")
-                    await self._solve_turnstile()
-                    await self._delay(1, 2)
+                # Может быть captcha на форме логина — но часто Turnstile решается сам
+                token_ready = await self.page.evaluate("""
+                    (() => {
+                        const el = document.querySelector('[name="cf-turnstile-response"]');
+                        return el && el.value && el.value.length > 20;
+                    })()
+                """)
+                if token_ready:
+                    logger.info("Turnstile уже решён автоматически — токен заполнен")
+                else:
+                    html = await self._html()
+                    if any(m in html for m in CAPTCHA_MARKERS):
+                        logger.info("CAPTCHA на форме логина — решаем...")
+                        await self._solve_turnstile()
+                        await self._delay(1, 2)
 
                 # Submit — кнопка "Sign In" (mat-stroked-button btn-brand-orange)
                 if not await self._click([
