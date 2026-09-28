@@ -318,18 +318,10 @@ async def run_monitor():
 
     budget = BudgetGuard()
 
-    # AstroProxy — автоматическое управление прокси
-    from proxy_manager import ProxyManager
-    proxy = ProxyManager()
-    if proxy.is_configured:
-        try:
-            proxy_url = await asyncio.to_thread(proxy.setup_best_proxy)
-            Config.PROXY_URL = proxy_url
-            logger.info("AstroProxy: %s", await asyncio.to_thread(proxy.stats_text))
-        except Exception as e:
-            logger.warning("AstroProxy setup failed: %s", e)
-    elif Config.PROXY_URL:
-        logger.info("Proxy (manual): %s", Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else "configured")
+    # Proxy setup
+    if Config.PROXY_URL:
+        safe = Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else "configured"
+        logger.info("Proxy: %s", safe)
     else:
         logger.warning("Proxy не настроен — риск бана!")
 
@@ -357,10 +349,12 @@ async def run_monitor():
 
     acct_list = ", ".join(a["email"] for a in accounts)
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
+    proxy_safe = Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else (Config.PROXY_URL[:30] or "none")
     await asyncio.to_thread(notify_status,
-        f"Мониторинг запущен v5.0 ({mode})\n"
+        f"Мониторинг запущен v5.1 ({mode})\n"
         f"URL: {Config.VFS_URL}\n"
         f"Аккаунтов: {n} | {acct_list}\n"
+        f"Proxy: {proxy_safe}\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
         f"Ночь: {Config.CHECK_INTERVAL_NIGHT_MIN}-{Config.CHECK_INTERVAL_NIGHT_MAX}с\n"
         f"Timezone: UTC+{Config.TIMEZONE_OFFSET}\n"
@@ -379,7 +373,7 @@ async def run_monitor():
                 if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
                     hot_mode_shared["active"] = False
                     await asyncio.to_thread(notify_status, "Hot mode закончился — слоты разобрали")
-                proxy_info = (await asyncio.to_thread(proxy.stats_text)) if proxy.is_configured else "Proxy: не настроен"
+                proxy_info = f"Proxy: {Config.PROXY_URL.split('@')[-1]}" if Config.PROXY_URL else "Proxy: не настроен"
                 hb = (
                     f"Heartbeat | {stats.summary()}\n"
                     f"{budget.stats_text()}\n"

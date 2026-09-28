@@ -63,12 +63,12 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # Адаптивные интервалы (секунды)
-    # День (10:00-22:00 Ташкент) — агрессивно
-    CHECK_INTERVAL_DAY_MIN = int(os.getenv("CHECK_INTERVAL_DAY_MIN", "30"))
-    CHECK_INTERVAL_DAY_MAX = int(os.getenv("CHECK_INTERVAL_DAY_MAX", "60"))
-    # Ночь — экономим captcha budget
-    CHECK_INTERVAL_NIGHT_MIN = int(os.getenv("CHECK_INTERVAL_NIGHT_MIN", "180"))
-    CHECK_INTERVAL_NIGHT_MAX = int(os.getenv("CHECK_INTERVAL_NIGHT_MAX", "300"))
+    # День (10:00-22:00 Ташкент)
+    CHECK_INTERVAL_DAY_MIN = int(os.getenv("CHECK_INTERVAL_DAY_MIN", "60"))
+    CHECK_INTERVAL_DAY_MAX = int(os.getenv("CHECK_INTERVAL_DAY_MAX", "120"))
+    # Ночь — экономим captcha budget и трафик
+    CHECK_INTERVAL_NIGHT_MIN = int(os.getenv("CHECK_INTERVAL_NIGHT_MIN", "300"))
+    CHECK_INTERVAL_NIGHT_MAX = int(os.getenv("CHECK_INTERVAL_NIGHT_MAX", "600"))
     # После обнаружения слотов — мониторим часто 15 мин
     CHECK_INTERVAL_HOT_MIN = int(os.getenv("CHECK_INTERVAL_HOT_MIN", "10"))
     CHECK_INTERVAL_HOT_MAX = int(os.getenv("CHECK_INTERVAL_HOT_MAX", "20"))
@@ -85,11 +85,9 @@ class Config:
     # Retention — скриншоты старше N часов удаляются (кроме slots_found)
     SCREENSHOT_RETENTION_HOURS = int(os.getenv("SCREENSHOT_RETENTION_HOURS", "24"))
 
-    # Резидентский прокси (опционально — вручную или через AstroProxy API)
+    # Proxy (Bright Data ISP or any HTTP/SOCKS5 proxy)
+    # Format: http://user:pass@host:port
     PROXY_URL = os.getenv("PROXY_URL", "")
-
-    # AstroProxy API (автоматическое управление прокси)
-    ASTROPROXY_TOKEN = os.getenv("ASTROPROXY_TOKEN", "")
 
     BROWSER_DATA_DIR = os.path.join(os.path.dirname(__file__), "browser_data")
     SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "screenshots")

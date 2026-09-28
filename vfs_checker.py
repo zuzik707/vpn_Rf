@@ -98,7 +98,7 @@ class VFSBrowser:
     # ── Proxy health ────────────────────────────────────────────────
 
     async def _check_proxy_health(self) -> bool:
-        """Verify proxy works before wasting time on navigation."""
+        """Verify proxy works — test against VFS domain directly."""
         if not self.proxy_url:
             return True
         try:
@@ -107,62 +107,48 @@ class VFSBrowser:
             if "://" not in proxy_for_curl:
                 proxy_for_curl = f"http://{proxy_for_curl}"
             result = subprocess.run(
-                ["curl", "-x", proxy_for_curl, "-s", "--max-time", "10",
-                 "https://httpbin.org/ip"],
-                capture_output=True, text=True, timeout=15,
+                ["curl", "-x", proxy_for_curl, "-s", "--max-time", "15",
+                 "-o", "/dev/null", "-w", "%{http_code}",
+                 "https://visa.vfsglobal.com/uzb/en/lva"],
+                capture_output=True, text=True, timeout=20,
             )
-            if result.returncode == 0 and "origin" in result.stdout:
-                ip = result.stdout.strip()
-                logger.info("[W%d] Proxy OK: %s", self.worker_id, ip[:80])
+            code = result.stdout.strip()
+            if result.returncode == 0 and code and code != "000":
+                logger.info("[W%d] Proxy OK (VFS HTTP %s)", self.worker_id, code)
                 return True
-            logger.warning("[W%d] Proxy check failed (rc=%d): %s",
-                          self.worker_id, result.returncode, result.stderr[:100])
+            logger.warning("[W%d] Proxy check failed (rc=%d, code=%s): %s",
+                          self.worker_id, result.returncode, code, result.stderr[:100])
             return False
         except Exception as e:
             logger.warning("[W%d] Proxy check error: %s", self.worker_id, e)
             return False
 
-    async def _rotate_proxy_ip(self) -> bool:
-        """Rotate AstroProxy IP via API."""
-        token = os.getenv("ASTROPROXY_TOKEN", "")
-        if not token:
-            return False
-        try:
-            import requests
-            ports = requests.get(
-                "https://astroproxy.com/api/v1/ports",
-                params={"token": token, "status": "active"}, timeout=10,
-            ).json().get("data", {}).get("ports", [])
-            if not ports:
-                logger.warning("[W%d] No active AstroProxy ports", self.worker_id)
-                return False
-            port_id = ports[0]["id"]
-            resp = requests.get(
-                f"https://astroproxy.com/api/v1/ports/{port_id}/newip",
-                params={"token": token}, timeout=10,
-            ).json()
-            new_ip = resp.get("data", {}).get("ip")
-            if new_ip:
-                logger.info("[W%d] IP rotated → %s", self.worker_id, new_ip)
-                return True
-            logger.warning("[W%d] IP rotation response: %s", self.worker_id, resp)
-            return False
-        except Exception as e:
-            logger.warning("[W%d] IP rotation failed: %s", self.worker_id, e)
-            return False
+    def _rotate_proxy_session(self) -> None:
+        """Rotate Bright Data session by changing session ID in proxy URL."""
+        if "brd.superproxy.io" not in self.proxy_url and "brightdata" not in self.proxy_url:
+            return
+        import re
+        base = re.sub(r'-session-[^:@]+', '', self.proxy_url)
+        session_id = f"sess{random.randint(100000, 999999)}"
+        at_idx = base.find('@')
+        if at_idx == -1:
+            return
+        colon_idx = base.rfind(':', 0, at_idx)
+        self.proxy_url = base[:colon_idx] + f"-session-{session_id}" + base[colon_idx:]
+        logger.info("[W%d] Bright Data session rotated → %s", self.worker_id, session_id)
 
     async def ensure_proxy_alive(self) -> bool:
-        """Check proxy, rotate IP if dead. Returns True if proxy is usable."""
+        """Check proxy, rotate session if dead. Returns True if proxy is usable."""
         if not self.proxy_url:
             return True
         if await self._check_proxy_health():
             return True
-        logger.warning("[W%d] Proxy dead — rotating IP...", self.worker_id)
-        if await self._rotate_proxy_ip():
-            await asyncio.sleep(3)
-            if await self._check_proxy_health():
-                return True
-        logger.error("[W%d] Proxy still dead after rotation", self.worker_id)
+        logger.warning("[W%d] Proxy dead — rotating session...", self.worker_id)
+        self._rotate_proxy_session()
+        await asyncio.sleep(3)
+        if await self._check_proxy_health():
+            return True
+        logger.error("[W%d] Proxy still dead after session rotation", self.worker_id)
         return False
 
     # ── Browser lifecycle ──────────────────────────────────────────
@@ -918,15 +904,22 @@ class VFSBrowser:
         url = await self._url()
         if "chrome-error" in url or "err_" in (await self._text()).lower():
             logger.error("[W%d] Page failed to load (proxy issue): %s", self.worker_id, url[:100])
-            if await self._rotate_proxy_ip():
-                await asyncio.sleep(3)
-                await self.page.get(Config.VFS_URL)
-                await self._delay(3, 5)
-                url = await self._url()
-                if "chrome-error" in url:
-                    logger.error("[W%d] Still can't load after IP rotation", self.worker_id)
-                    return False
-            else:
+            self._rotate_proxy_session()
+            await asyncio.sleep(3)
+            # Restart browser with new proxy session
+            await self.close_browser()
+            await self.start_browser()
+            self.page = await self.browser.get("about:blank")
+            await setup_stealth_on_new_page(self.page, self._profile_path)
+            if self._proxy_auth:
+                await self._setup_proxy_auth(self.page, *self._proxy_auth)
+            self.hc = HumanClicker(self.page)
+            self.warmer = SessionWarmer(self.page, self.hc)
+            await self.page.get(Config.VFS_URL)
+            await self._delay(3, 5)
+            url = await self._url()
+            if "chrome-error" in url:
+                logger.error("[W%d] Still can't load after session rotation", self.worker_id)
                 return False
 
         for attempt in range(4):
@@ -1327,15 +1320,13 @@ class VFSBrowser:
         # Check for proxy/network failure
         url = await self._url()
         if "chrome-error" in url:
-            logger.warning("Dashboard load failed — proxy issue")
-            if await self._rotate_proxy_ip():
-                await asyncio.sleep(3)
-                await self.page.get(f"{self.VFS_BASE}/dashboard")
-                await self._delay(3, 5)
-                url = await self._url()
-                if "chrome-error" in url:
-                    return False
-            else:
+            logger.warning("Dashboard load failed — proxy issue, rotating session")
+            self._rotate_proxy_session()
+            await asyncio.sleep(3)
+            await self.page.get(f"{self.VFS_BASE}/dashboard")
+            await self._delay(3, 5)
+            url = await self._url()
+            if "chrome-error" in url:
                 return False
 
         if not await self._handle_obstacle():
