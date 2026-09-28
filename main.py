@@ -32,12 +32,14 @@ from notifier import notify_error, notify_slots_found, notify_status
 from session_manager import SessionStats, save_session_state, load_session_state
 from vfs_checker import VFSBrowser
 
+from logging.handlers import RotatingFileHandler
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("vfs_monitor.log", encoding="utf-8"),
+        RotatingFileHandler("vfs_monitor.log", maxBytes=10*1024*1024, backupCount=3, encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)

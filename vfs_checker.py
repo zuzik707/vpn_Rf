@@ -88,6 +88,13 @@ class VFSBrowser:
     async def start_browser(self) -> None:
         os.makedirs(Config.BROWSER_DATA_DIR, exist_ok=True)
         os.makedirs(Config.SCREENSHOT_DIR, exist_ok=True)
+        for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            lock_path = os.path.join(Config.BROWSER_DATA_DIR, lock)
+            if os.path.exists(lock_path):
+                try:
+                    os.remove(lock_path)
+                except OSError:
+                    pass
         args = get_chrome_args()
         self._proxy_auth = None
         if Config.PROXY_URL:
@@ -179,6 +186,7 @@ class VFSBrowser:
                 })
             with open(COOKIES_PATH, "w") as f:
                 json.dump(serializable, f)
+            os.chmod(COOKIES_PATH, 0o600)
             logger.debug("Saved %d cookies", len(serializable))
         except Exception as e:
             logger.debug("Cookie save failed: %s", e)
@@ -192,11 +200,14 @@ class VFSBrowser:
                 cookies = json.load(f)
             for c in cookies:
                 try:
-                    await self.page.send(net_cdp.set_cookie(
+                    kwargs = dict(
                         name=c["name"], value=c["value"], domain=c.get("domain"),
                         path=c.get("path", "/"), expires=c.get("expires"),
                         http_only=c.get("httpOnly", False), secure=c.get("secure", False),
-                    ))
+                    )
+                    if c.get("sameSite"):
+                        kwargs["same_site"] = c["sameSite"]
+                    await self.page.send(net_cdp.set_cookie(**kwargs))
                 except Exception:
                     pass
             logger.info("Restored %d cookies from disk", len(cookies))
@@ -208,7 +219,18 @@ class VFSBrowser:
         await self.interceptor.detach()
         if self.browser:
             try:
-                self.browser.stop()
+                result = self.browser.stop()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+            # Kill any zombie chrome processes from this user data dir
+            try:
+                import subprocess
+                subprocess.run(
+                    ["pkill", "-f", f"chrome.*{Config.BROWSER_DATA_DIR}"],
+                    capture_output=True, timeout=5,
+                )
             except Exception:
                 pass
         self.browser = None
@@ -755,6 +777,11 @@ class VFSBrowser:
                 pass
         self.page = await self.browser.get("about:blank")
         await setup_stealth_on_new_page(self.page)
+        try:
+            import nodriver.cdp.emulation as emu_cdp
+            await self.page.send(emu_cdp.set_timezone_override(timezone_id="Asia/Tashkent"))
+        except Exception as e:
+            logger.debug("Timezone override failed: %s", e)
         if self._proxy_auth:
             await self._setup_proxy_auth(self.page, *self._proxy_auth)
         self.hc = HumanClicker(self.page)

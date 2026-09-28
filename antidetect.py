@@ -58,12 +58,14 @@ async def setup_stealth_on_new_page(page) -> None:
     except Exception as e:
         logger.debug("CDP addScript method 2 failed: %s", e)
 
-    # Method 3: direct evaluate as fallback (runs once, not on new documents)
+    # Method 3: evaluate fallback is DANGEROUS — stealth lost on navigation.
+    # Store script so we can re-inject after each navigation.
+    page._stealth_script = script
     try:
         await page.evaluate(script)
-        logger.info("Stealth injected via evaluate fallback (%d bytes)", len(script))
+        logger.warning("Stealth via evaluate only — will re-inject on navigation. addScriptToEvaluateOnNewDocument failed.")
     except Exception as e:
-        logger.warning("All stealth injection methods failed: %s", e)
+        logger.error("ALL stealth injection failed: %s — browser is detectable!", e)
 
 
 def get_chrome_args() -> list[str]:
@@ -92,7 +94,7 @@ def get_chrome_args() -> list[str]:
         "--disable-translate",
         "--metrics-recording-only",
         "--mute-audio",
-        "--no-zygote",
-        "--single-process",
+        "--renderer-process-limit=1",
+        "--disable-background-timer-throttling",
         "--js-flags=--max-old-space-size=256",
     ]

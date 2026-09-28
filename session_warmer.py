@@ -40,7 +40,7 @@ class SessionWarmer:
         try:
             for step in WARM_ROUTE:
                 logger.info("Warming: %s → %s", step["label"], step["url"])
-                await self.page.get(step["url"])
+                await asyncio.wait_for(self.page.get(step["url"]), timeout=60)
                 await asyncio.sleep(random.uniform(*step["wait"]))
 
                 if self.hc:
@@ -52,7 +52,7 @@ class SessionWarmer:
 
             # Финальный переход на login
             logger.info("Warming: переход на login")
-            await self.page.get(LOGIN_URL)
+            await asyncio.wait_for(self.page.get(LOGIN_URL), timeout=60)
             await asyncio.sleep(random.uniform(1.5, 3.0))
 
             if self.hc:

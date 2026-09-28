@@ -90,35 +90,51 @@ def build_stealth_script(profile: dict) -> str:
     w, h = vp
 
     return f"""
-    // --- 1. webdriver cleanup (nodriver handles most, safety net) ---
-    Object.defineProperty(navigator, 'webdriver', {{get: () => undefined, configurable: true}});
+    // --- Helper: native-looking defineProperty (value-based, correct descriptors) ---
+    const _nativeDef = (obj, prop, val) => {{
+        Object.defineProperty(obj, prop, {{
+            value: val, configurable: true, enumerable: true, writable: false
+        }});
+    }};
+    // Helper: spoof toString on patched functions
+    const _spoofToString = (fn, name) => {{
+        fn.toString = () => 'function ' + name + '() {{ [native code] }}';
+        if (fn.toString.toString) fn.toString.toString = () => 'function toString() {{ [native code] }}';
+    }};
+
+    // --- 1. webdriver cleanup ---
+    _nativeDef(Navigator.prototype, 'webdriver', undefined);
     try {{ delete navigator.__proto__.webdriver; }} catch(e) {{}}
 
-    // --- 2. WebGL fingerprint (must match Linux platform) ---
+    // --- 2. WebGL fingerprint (toString-safe) ---
     const _patchGL = (proto) => {{
         const orig = proto.getParameter;
-        proto.getParameter = function(p) {{
+        const patched = function getParameter(p) {{
             if (p === 37445) return '{vendor}';
             if (p === 37446) return '{renderer}';
             return orig.call(this, p);
         }};
+        _spoofToString(patched, 'getParameter');
+        proto.getParameter = patched;
     }};
     _patchGL(WebGLRenderingContext.prototype);
     if (typeof WebGL2RenderingContext !== 'undefined') _patchGL(WebGL2RenderingContext.prototype);
 
-    // --- 3. Hardware specs (must be plausible for claimed GPU) ---
-    Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => {hc}}});
-    Object.defineProperty(navigator, 'deviceMemory', {{get: () => {dm}}});
+    // --- 3. Hardware specs (value-based, not getter) ---
+    _nativeDef(Navigator.prototype, 'hardwareConcurrency', {hc});
+    _nativeDef(Navigator.prototype, 'deviceMemory', {dm});
 
-    // --- 4. navigator.languages (must match proxy geo, not VPS locale) ---
-    Object.defineProperty(navigator, 'languages', {{get: () => ['en-US', 'en', 'uz']}});
-    Object.defineProperty(navigator, 'language', {{get: () => 'en-US'}});
+    // --- 4. navigator.languages ---
+    Object.defineProperty(Navigator.prototype, 'languages', {{
+        get: () => Object.freeze(['en-US', 'en', 'uz']),
+        configurable: true, enumerable: true
+    }});
+    _nativeDef(Navigator.prototype, 'language', 'en-US');
 
     // --- 5. chrome.runtime stub ---
     if (!window.chrome) window.chrome = {{}};
     if (!window.chrome.runtime) {{
         window.chrome.runtime = {{
-            id: undefined,
             connect: function() {{ throw new Error('Invalid extension id: ""'); }},
             sendMessage: function() {{ throw new Error('Invalid extension id: ""'); }},
             getManifest: function() {{}},
@@ -127,35 +143,36 @@ def build_stealth_script(profile: dict) -> str:
         }};
     }}
 
-    // --- 6. outerWidth/Height + screen dimensions (must match viewport) ---
+    // --- 6. outerWidth/Height + screen ---
     if (window.outerWidth === 0) {{
-        Object.defineProperty(window, 'outerWidth', {{get: () => window.innerWidth + 16}});
+        Object.defineProperty(window, 'outerWidth', {{get: () => window.innerWidth + 16, configurable: true}});
     }}
     if (window.outerHeight === 0) {{
-        Object.defineProperty(window, 'outerHeight', {{get: () => window.innerHeight + 88}});
+        Object.defineProperty(window, 'outerHeight', {{get: () => window.innerHeight + 88, configurable: true}});
     }}
-    Object.defineProperty(window.screen, 'width', {{get: () => {w}}});
-    Object.defineProperty(window.screen, 'height', {{get: () => {h}}});
-    Object.defineProperty(window.screen, 'availWidth', {{get: () => {w}}});
-    Object.defineProperty(window.screen, 'availHeight', {{get: () => {h} - 40}});
-    Object.defineProperty(window.screen, 'colorDepth', {{get: () => 24}});
+    _nativeDef(window.screen, 'width', {w});
+    _nativeDef(window.screen, 'height', {h});
+    _nativeDef(window.screen, 'availWidth', {w});
+    _nativeDef(window.screen, 'availHeight', {h} - 40);
+    _nativeDef(window.screen, 'colorDepth', 24);
 
     // --- 7. connection rtt ---
     if (navigator.connection) {{
-        Object.defineProperty(navigator.connection, 'rtt', {{get: () => {rtt}}});
+        _nativeDef(navigator.connection, 'rtt', {rtt});
     }}
 
-    // --- 8. WebRTC IP leak protection ---
-    const origRTC = window.RTCPeerConnection;
-    window.RTCPeerConnection = function(...args) {{
-        if (args[0] && args[0].iceServers) args[0].iceServers = [];
-        const pc = new origRTC(...args);
-        const origCreate = pc.createDataChannel.bind(pc);
-        return pc;
-    }};
-    window.RTCPeerConnection.prototype = origRTC.prototype;
-    if (window.webkitRTCPeerConnection) {{
-        window.webkitRTCPeerConnection = window.RTCPeerConnection;
+    // --- 8. WebRTC IP leak protection (Proxy-based, preserves instanceof) ---
+    if (window.RTCPeerConnection) {{
+        const _origRTC = window.RTCPeerConnection;
+        window.RTCPeerConnection = new Proxy(_origRTC, {{
+            construct(target, args) {{
+                if (args[0] && args[0].iceServers) args[0].iceServers = [];
+                return new target(...args);
+            }}
+        }});
+        window.RTCPeerConnection.prototype = _origRTC.prototype;
+        _spoofToString(window.RTCPeerConnection, 'RTCPeerConnection');
+        if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = window.RTCPeerConnection;
     }}
 
     // --- 9. CDP variable cleanup ---
@@ -168,54 +185,70 @@ def build_stealth_script(profile: dict) -> str:
         }}
     }})();
 
-    // --- 10. Canvas noise (stable seed, covers getImageData + toDataURL) ---
+    // --- 10. Canvas noise (skips Turnstile challenge canvases) ---
     const _seed = {seed};
     function _addCanvasNoise(data) {{
         for (let i = 0; i < data.length; i += 4) {{
             if (((_seed + i) * 9301 + 49297) % 233280 < 2332) data[i] ^= 1;
         }}
     }}
+    function _isChallengeCanvas(canvas) {{
+        try {{
+            if (!canvas || !canvas.closest) return false;
+            return !!(canvas.closest('.cf-turnstile, [data-challenge], iframe'));
+        }} catch(e) {{ return false; }}
+    }}
     const _origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-    CanvasRenderingContext2D.prototype.getImageData = function(...args) {{
+    const _patchedGetImageData = function getImageData(...args) {{
         const d = _origGetImageData.apply(this, args);
-        _addCanvasNoise(d.data);
+        if (!_isChallengeCanvas(this.canvas)) _addCanvasNoise(d.data);
         return d;
     }};
+    _spoofToString(_patchedGetImageData, 'getImageData');
+    CanvasRenderingContext2D.prototype.getImageData = _patchedGetImageData;
+
     const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function(...args) {{
-        try {{
-            const ctx = this.getContext('2d');
-            if (ctx) {{
-                const d = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
-                _addCanvasNoise(d.data);
-                ctx.putImageData(d, 0, 0);
-            }}
-        }} catch(e) {{}}
+    const _patchedToDataURL = function toDataURL(...args) {{
+        if (!_isChallengeCanvas(this)) {{
+            try {{
+                const ctx = this.getContext('2d');
+                if (ctx) {{
+                    const d = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
+                    _addCanvasNoise(d.data);
+                    ctx.putImageData(d, 0, 0);
+                }}
+            }} catch(e) {{}}
+        }}
         return _origToDataURL.apply(this, args);
     }};
+    _spoofToString(_patchedToDataURL, 'toDataURL');
+    HTMLCanvasElement.prototype.toDataURL = _patchedToDataURL;
+
     const _origToBlob = HTMLCanvasElement.prototype.toBlob;
-    HTMLCanvasElement.prototype.toBlob = function(cb, ...args) {{
-        try {{
-            const ctx = this.getContext('2d');
-            if (ctx) {{
-                const d = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
-                _addCanvasNoise(d.data);
-                ctx.putImageData(d, 0, 0);
-            }}
-        }} catch(e) {{}}
+    const _patchedToBlob = function toBlob(cb, ...args) {{
+        if (!_isChallengeCanvas(this)) {{
+            try {{
+                const ctx = this.getContext('2d');
+                if (ctx) {{
+                    const d = _origGetImageData.call(ctx, 0, 0, this.width, this.height);
+                    _addCanvasNoise(d.data);
+                    ctx.putImageData(d, 0, 0);
+                }}
+            }} catch(e) {{}}
+        }}
         return _origToBlob.call(this, cb, ...args);
     }};
+    _spoofToString(_patchedToBlob, 'toBlob');
+    HTMLCanvasElement.prototype.toBlob = _patchedToBlob;
 
     // --- 11. AudioContext fingerprint noise ---
-    const _origGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
-    AnalyserNode.prototype.getFloatFrequencyData = function(arr) {{
-        _origGetFloatFreq.call(this, arr);
-        for (let i = 0; i < arr.length; i += 7) arr[i] += 0.001 * ((_seed + i) % 3 - 1);
-    }};
-    const _origCreateOsc = AudioContext.prototype.createOscillator;
-    AudioContext.prototype.createOscillator = function() {{
-        const osc = _origCreateOsc.call(this);
-        const _origFreq = Object.getOwnPropertyDescriptor(OscillatorNode.prototype, 'frequency');
-        return osc;
-    }};
+    if (typeof AnalyserNode !== 'undefined') {{
+        const _origGetFloatFreq = AnalyserNode.prototype.getFloatFrequencyData;
+        const _patchedFloat = function getFloatFrequencyData(arr) {{
+            _origGetFloatFreq.call(this, arr);
+            for (let i = 0; i < arr.length; i += 7) arr[i] += 0.001 * ((_seed + i) % 3 - 1);
+        }};
+        _spoofToString(_patchedFloat, 'getFloatFrequencyData');
+        AnalyserNode.prototype.getFloatFrequencyData = _patchedFloat;
+    }}
     """

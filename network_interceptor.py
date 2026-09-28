@@ -74,10 +74,17 @@ class NetworkInterceptor:
                 "status": event.response.status,
                 "request_id": event.request_id,
             })
+            if len(self.captured) > 50:
+                self.captured = self.captured[-20:]
+            if len(self._bodies) > 50:
+                oldest = list(self._bodies.keys())[:30]
+                for k in oldest:
+                    del self._bodies[k]
             logger.info("API перехвачен: %s (status=%d)",
                         event.response.url[:120], event.response.status)
             import asyncio
-            asyncio.ensure_future(self._fetch_body_now(event.request_id))
+            task = asyncio.ensure_future(self._fetch_body_now(event.request_id))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         except Exception as e:
             logger.debug("Response event error: %s", e)
 
