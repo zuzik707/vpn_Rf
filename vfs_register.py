@@ -183,33 +183,24 @@ class VFSRegistrar:
                     break
                 await self._delay(1, 2)
 
-            # Заполняем Email
+            # Angular-совместимое заполнение: используем нативный setter
+            # чтобы Angular Reactive Forms увидел изменения
             email_js = _js_str(email)
             email_filled = await self.page.evaluate(f"""
                 (() => {{
-                    const email = {email_js};
-                    const inputs = document.querySelectorAll('input');
-                    for (const inp of inputs) {{
-                        if (inp.offsetParent === null) continue;
-                        const cs = window.getComputedStyle(inp);
-                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                        if (inp.type === 'email' || inp.id === 'email' ||
-                            (inp.placeholder && inp.placeholder.toLowerCase().includes('email')) ||
-                            inp.getAttribute('formcontrolname') === 'email' ||
-                            inp.getAttribute('formcontrolname') === 'username') {{
-                            inp.focus();
-                            inp.value = '';
-                            inp.dispatchEvent(new Event('focus'));
-                            for (const ch of email) {{
-                                inp.value += ch;
-                                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                            }}
-                            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
-                            return true;
-                        }}
-                    }}
-                    return false;
+                    const val = {email_js};
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value').set;
+                    const inp = document.querySelector(
+                        'input[formcontrolname="emailid"], input#inputEmail, input[type="email"]');
+                    if (!inp) return false;
+                    inp.focus();
+                    inp.dispatchEvent(new Event('focus', {{bubbles: true}}));
+                    setter.call(inp, val);
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                    return true;
                 }})()
             """)
 
@@ -224,23 +215,16 @@ class VFSRegistrar:
             pwd_filled = await self.page.evaluate(f"""
                 (() => {{
                     const pwd = {pwd_js};
-                    const inputs = document.querySelectorAll('input[type="password"]');
-                    const visible = [];
-                    for (const inp of inputs) {{
-                        if (inp.offsetParent === null) continue;
-                        const cs = window.getComputedStyle(inp);
-                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                        visible.push(inp);
-                    }}
-                    if (visible.length < 2) return false;
-                    for (const inp of visible.slice(0, 2)) {{
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value').set;
+                    const pwdInp = document.querySelector('input[formcontrolname="password"]');
+                    const confirmInp = document.querySelector('input[formcontrolname="confirmPassword"]');
+                    if (!pwdInp || !confirmInp) return false;
+                    for (const inp of [pwdInp, confirmInp]) {{
                         inp.focus();
-                        inp.value = '';
-                        inp.dispatchEvent(new Event('focus'));
-                        for (const ch of pwd) {{
-                            inp.value += ch;
-                            inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                        }}
+                        inp.dispatchEvent(new Event('focus', {{bubbles: true}}));
+                        setter.call(inp, pwd);
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
                         inp.dispatchEvent(new Event('change', {{bubbles: true}}));
                         inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
                     }}
@@ -254,39 +238,18 @@ class VFSRegistrar:
 
             await self._delay(0.5, 1.0)
 
-            # Заполняем Dial Code
-            code_js = _js_str(dial_code)
-            await self.page.evaluate(f"""
-                (() => {{
-                    const code = {code_js};
-                    const selects = document.querySelectorAll('mat-select, select');
-                    for (const sel of selects) {{
-                        const label = sel.closest('mat-form-field, .form-group, div');
-                        const labelText = label ? label.textContent.toLowerCase() : '';
-                        if (labelText.includes('dial') || labelText.includes('code') ||
-                            (sel.getAttribute('formcontrolname') || '').includes('dial') ||
-                            (sel.getAttribute('formcontrolname') || '').includes('code')) {{
-                            if (sel.tagName === 'SELECT') {{
-                                for (const opt of sel.options) {{
-                                    if (opt.textContent.includes(code) || opt.value.includes(code)) {{
-                                        sel.value = opt.value;
-                                        sel.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                        return true;
-                                    }}
-                                }}
-                            }} else {{
-                                sel.click();
-                                return 'mat-select';
-                            }}
-                        }}
-                    }}
-                    return false;
-                }})()
+            # Заполняем Dial Code — кликаем mat-select чтобы открыть dropdown
+            await self.page.evaluate("""
+                (() => {
+                    const sel = document.querySelector('mat-select[formcontrolname="dialcode"]');
+                    if (sel) sel.click();
+                })()
             """)
 
-            await self._delay(0.5, 0.8)
+            await self._delay(0.8, 1.2)
 
-            # Если mat-select — ищем +998 в overlay
+            # Ищем +998 в overlay
+            code_js = _js_str(dial_code)
             await self.page.evaluate(f"""
                 (() => {{
                     const code = {code_js};
@@ -303,56 +266,41 @@ class VFSRegistrar:
                 }})()
             """)
 
-            await self._delay(0.3, 0.6)
+            await self._delay(0.5, 0.8)
 
-            # Заполняем Mobile Number
+            # Заполняем Mobile Number (formcontrolname="contact")
             phone_js = _js_str(phone)
             await self.page.evaluate(f"""
                 (() => {{
-                    const phone = {phone_js};
-                    const inputs = document.querySelectorAll('input');
-                    for (const inp of inputs) {{
-                        if (inp.offsetParent === null) continue;
-                        const cs = window.getComputedStyle(inp);
-                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                        const fc = inp.getAttribute('formcontrolname') || '';
-                        const ph = (inp.placeholder || '').toLowerCase();
-                        const id = (inp.id || '').toLowerCase();
-                        if (fc.includes('mobile') || fc.includes('phone') ||
-                            ph.includes('mobile') || ph.includes('phone') ||
-                            id.includes('mobile') || id.includes('phone') ||
-                            inp.type === 'tel') {{
-                            inp.focus();
-                            inp.value = '';
-                            for (const ch of phone) {{
-                                inp.value += ch;
-                                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                            }}
-                            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                            inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
-                            return true;
-                        }}
-                    }}
-                    return false;
+                    const val = {phone_js};
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value').set;
+                    const inp = document.querySelector('input[formcontrolname="contact"]');
+                    if (!inp) return false;
+                    inp.focus();
+                    inp.dispatchEvent(new Event('focus', {{bubbles: true}}));
+                    setter.call(inp, val);
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                    return true;
                 }})()
             """)
 
             await self._delay(0.5, 1.0)
 
-            # Ставим все чекбоксы
+            # Ставим все 3 чекбокса (кликаем label чтобы Angular увидел)
             await self.page.evaluate("""
                 (() => {
-                    const checkboxes = document.querySelectorAll(
-                        'mat-checkbox, input[type="checkbox"]'
-                    );
-                    for (const cb of checkboxes) {
-                        if (cb.tagName === 'MAT-CHECKBOX') {
+                    const names = ['processPerDataAgreed', 'intTransPerDataAgreed', 'termAndConditionAgreed'];
+                    for (const name of names) {
+                        const cb = document.querySelector('mat-checkbox[formcontrolname="' + name + '"]');
+                        if (cb) {
                             const inner = cb.querySelector('input[type="checkbox"]');
                             if (inner && !inner.checked) {
-                                cb.click();
+                                const label = cb.querySelector('label') || cb;
+                                label.click();
                             }
-                        } else if (!cb.checked) {
-                            cb.click();
                         }
                     }
                 })()
