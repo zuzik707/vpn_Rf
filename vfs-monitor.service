@@ -19,9 +19,10 @@ MemoryHigh=3000M
 CPUQuota=350%
 LimitNOFILE=4096
 
-# Logging
-StandardOutput=append:/root/vpn_Rf/vfs_monitor.log
-StandardError=append:/root/vpn_Rf/vfs_monitor.log
+# Logging — Python logging already writes to vfs_monitor.log via RotatingFileHandler
+# Don't duplicate by also redirecting stdout/stderr there
+StandardOutput=journal
+StandardError=journal
 
 # Kill Chrome properly
 KillMode=mixed
