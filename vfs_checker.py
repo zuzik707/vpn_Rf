@@ -34,6 +34,7 @@ from config import Config
 from dom_dumper import dump_page
 from human_clicker import HumanClicker
 from network_interceptor import NetworkInterceptor
+from proxy_auth_helper import setup_proxy_auth_extension
 from session_warmer import SessionWarmer
 
 logger = logging.getLogger(__name__)
@@ -168,6 +169,10 @@ class VFSBrowser:
         if self.proxy_url:
             proxy_for_chrome, self._proxy_auth = self._parse_proxy_url(self.proxy_url)
             args.append(f"--proxy-server={proxy_for_chrome}")
+            if self._proxy_auth:
+                ext_path = setup_proxy_auth_extension(self._proxy_auth[0], self._proxy_auth[1])
+                args.append(f"--load-extension={ext_path}")
+                logger.info("[W%d] Proxy auth via Chrome extension", self.worker_id)
             logger.info("[W%d] Proxy: %s", self.worker_id,
                         proxy_for_chrome.split("@")[-1] if "@" in proxy_for_chrome else proxy_for_chrome)
         has_display = bool(os.environ.get("DISPLAY"))
@@ -195,39 +200,8 @@ class VFSBrowser:
         return clean, auth
 
     async def _setup_proxy_auth(self, page, username: str, password: str) -> None:
-        """Handle proxy authentication via CDP Fetch domain.
-        Keeps Fetch enabled for the entire session — Bright Data requires auth on every request."""
-        try:
-            import nodriver.cdp.fetch as fetch_cdp
-
-            await page.send(fetch_cdp.enable(handle_auth_requests=True, patterns=[
-                fetch_cdp.RequestPattern(request_stage=fetch_cdp.RequestStage.RESPONSE),
-            ]))
-
-            def on_auth(event: fetch_cdp.AuthRequired):
-                import asyncio
-                asyncio.ensure_future(page.send(
-                    fetch_cdp.continue_with_auth(
-                        request_id=event.request_id,
-                        auth_challenge_response=fetch_cdp.AuthChallengeResponse(
-                            response="ProvideCredentials",
-                            username=username,
-                            password=password,
-                        )
-                    )
-                ))
-
-            def on_request_paused(event: fetch_cdp.RequestPaused):
-                import asyncio
-                asyncio.ensure_future(page.send(
-                    fetch_cdp.continue_request(request_id=event.request_id)
-                ))
-
-            page.add_handler(fetch_cdp.AuthRequired, on_auth)
-            page.add_handler(fetch_cdp.RequestPaused, on_request_paused)
-            logger.info("Proxy auth configured via CDP Fetch (persistent)")
-        except Exception as e:
-            logger.warning("Proxy auth setup failed: %s — proxy may not require auth", e)
+        """No-op — proxy auth now handled by Chrome extension."""
+        pass
 
     async def _save_cookies(self) -> None:
         if not self.page:

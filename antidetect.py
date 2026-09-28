@@ -87,7 +87,6 @@ def get_chrome_args(profile_path: str = "") -> list[str]:
         "--disable-gpu",
         "--disable-dev-shm-usage",
         "--no-sandbox",
-        "--disable-extensions",
         "--disable-background-networking",
         "--disable-default-apps",
         "--disable-sync",
