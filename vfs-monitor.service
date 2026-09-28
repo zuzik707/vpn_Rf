@@ -1,0 +1,24 @@
+[Unit]
+Description=VFS Global Slot Detector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/vpn_Rf
+ExecStart=/usr/bin/xvfb-run /root/vpn_Rf/venv/bin/python /root/vpn_Rf/main.py
+Restart=always
+RestartSec=30
+Environment=DISPLAY=:99
+
+# Логи
+StandardOutput=journal
+StandardError=journal
+
+# Лимиты
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
