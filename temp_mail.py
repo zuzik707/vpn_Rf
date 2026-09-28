@@ -27,8 +27,13 @@ class TempMailClient:
         # Получаем доступный домен
         resp = self._session.get(f"{BASE_URL}/domains", timeout=10)
         resp.raise_for_status()
-        domains = resp.json().get("hydra:member", [])
-        active = [d for d in domains if d.get("isActive")]
+        data = resp.json()
+        # API может вернуть список напрямую или объект с hydra:member
+        if isinstance(data, list):
+            domains = data
+        else:
+            domains = data.get("hydra:member", [])
+        active = [d for d in domains if isinstance(d, dict) and d.get("isActive")]
         if not active:
             raise RuntimeError("Нет доступных доменов на mail.tm")
 
@@ -83,7 +88,8 @@ class TempMailClient:
             try:
                 resp = self._session.get(f"{BASE_URL}/messages", timeout=10)
                 if resp.ok:
-                    messages = resp.json().get("hydra:member", [])
+                    data = resp.json()
+                    messages = data if isinstance(data, list) else data.get("hydra:member", [])
                     for msg in messages:
                         sender = msg.get("from", {}).get("address", "").lower()
                         if from_contains.lower() in sender:
