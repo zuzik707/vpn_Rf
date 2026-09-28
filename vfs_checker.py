@@ -1405,7 +1405,45 @@ class VFSBrowser:
         if not await self._select_dropdown_option("sub-category", subcategory):
             return False, f"Не удалось выбрать Sub-category: {subcategory}", None
 
-        await self._delay(2.0, 4.0)
+        # Ждём пока API ответит или появится банер/результат (до 20с)
+        logger.info("Ждём результат проверки слотов...")
+        for wait_i in range(10):
+            await self._delay(1.5, 2.5)
+            # Проверяем: спиннер пропал? банер появился? API ответил?
+            ready = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    // Синий банер "no appointment slots"
+                    if (text.includes('no appointment slots')) return 'no_slots';
+                    // Банер через DOM
+                    const alert = document.querySelector('.Information [role="alert"], [role="alert"]');
+                    if (alert && alert.textContent.toLowerCase().includes('no appointment')) return 'no_slots_dom';
+                    // Кнопка Continue активна = слоты есть
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent.toLowerCase().includes('continue') && !b.disabled &&
+                            !b.classList.contains('mat-mdc-button-disabled'))
+                            return 'slots_available';
+                    }
+                    // Continue disabled = нет слотов (но загрузка завершена)
+                    for (const b of btns) {
+                        if (b.textContent.toLowerCase().includes('continue') &&
+                            (b.disabled || b.classList.contains('mat-mdc-button-disabled')))
+                            return 'no_slots_btn';
+                    }
+                    // Спиннер ещё крутится
+                    const spinner = document.querySelector('.mat-mdc-progress-spinner, mat-spinner, .loading, .spinner');
+                    if (spinner) return null;
+                    // API уже ответил?
+                    return null;
+                })()
+            """)
+            if ready:
+                logger.info("Результат готов после %.0fс: %s", (wait_i + 1) * 2, ready)
+                break
+            if self.interceptor.has_data:
+                logger.info("API ответил после %.0fс", (wait_i + 1) * 2)
+                break
         await self._screenshot("after_subcategory_select")
 
         # Шаг 7: Читаем результат — двойная проверка (API + DOM)
