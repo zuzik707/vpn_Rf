@@ -499,23 +499,38 @@ async def run_monitor():
     BAN_COOLDOWN = 1800  # 30 min auto-unban
     banned_emails: dict[str, float] = {}  # email → ban timestamp
     login_fails: dict[str, int] = {}  # email → consecutive login failures
-    relay_events = [asyncio.Event(), asyncio.Event()]
-    relay_events[0].set()  # Worker 0 starts immediately
+    # Two event types per worker:
+    #   login_events  — "начинай логин" (сигналится когда другой начал проверку)
+    #   check_events  — "начинай проверку слотов" (сигналится когда другой закончил)
+    login_events = [asyncio.Event(), asyncio.Event()]
+    check_events = [asyncio.Event(), asyncio.Event()]
+    login_events[0].set()   # W0 начинает логин сразу
+    check_events[0].set()   # W0 начинает проверку сразу (первый цикл)
 
     async def relay_worker(wid: int):
         proxy_wid = 10 + wid
         consecutive_errors = 0
-        my_event = relay_events[wid]
-        other_event = relay_events[1 - wid]
+        my_login = login_events[wid]
+        my_check = check_events[wid]
+        other_login = login_events[1 - wid]
+        other_check = check_events[1 - wid]
 
         while running:
-            # Clean up stale entries from banned_emails (login-fail cooldowns)
+            # Phase 0: Wait for login signal
+            try:
+                await asyncio.wait_for(my_login.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                if not running:
+                    break
+                continue
+            my_login.clear()
+
+            # Clean up stale entries from banned_emails
             now = time.time()
             expired = [e for e, t in banned_emails.items() if now - t >= BAN_COOLDOWN]
             for email_ub in expired:
                 del banned_emails[email_ub]
                 login_fails.pop(email_ub, None)
-                logger.info("Cooldown expired: %s (убран из banned_emails)", email_ub)
 
             db_accounts = get_scout_accounts()
             if not db_accounts:
@@ -525,11 +540,15 @@ async def run_monitor():
             if not available:
                 logger.warning("R%d: Нет доступных аккаунтов, жду 60с...", wid)
                 await asyncio.sleep(60)
+                other_login.set()
+                other_check.set()
                 continue
 
             if is_quiet_hours():
                 logger.info("R%d: Тихие часы — сплю 10 мин", wid)
                 await asyncio.sleep(600)
+                other_login.set()
+                other_check.set()
                 continue
 
             acct = random.choice(available)
@@ -542,11 +561,11 @@ async def run_monitor():
                 proxy_url=proxy_url, worker_id=proxy_wid,
             )
 
-            signaled = False
+            signaled_login = False
+            signaled_check = False
             try:
-                # Phase 1: Login IMMEDIATELY (no wait for event)
+                # Phase 1: LOGIN
                 stats.logins_total += 1
-                logger.info("%s Логин (warming параллельно)...", tag)
                 login_ok = await checker.login()
 
                 if checker.banned:
@@ -574,26 +593,28 @@ async def run_monitor():
 
                 consecutive_errors = 0
                 login_fails[email] = 0
-                logger.info("%s Залогинился, жду очередь на проверку слотов...", tag)
                 login_screen = await checker._screenshot("login_ok")
                 await asyncio.to_thread(
                     send_telegram_photo, login_screen,
                     f"✅ {tag} залогинился")
+                logger.info("%s Залогинился, жду очередь на проверку...", tag)
 
-                # Phase 2: WAIT for turn to check slots (sequential access to VFS)
+                # Phase 2: WAIT for check turn
                 try:
-                    await asyncio.wait_for(my_event.wait(), timeout=300)
+                    await asyncio.wait_for(my_check.wait(), timeout=300)
                 except asyncio.TimeoutError:
                     if not running:
                         break
-                    logger.warning("%s Timeout ожидания очереди — пропускаю цикл", tag)
+                    logger.warning("%s Timeout ожидания очереди — пропускаю", tag)
                     await checker.close_browser()
                     continue
-                my_event.clear()
+                my_check.clear()
 
-                await asyncio.to_thread(notify_status, f"{tag} очередь получена, проверяю слоты")
+                # Phase 3: CHECK SLOTS — signal other worker to start LOGIN now
+                other_login.set()
+                signaled_login = True
+                logger.info("%s Начинаю проверку слотов (W%d логинится)", tag, 1 - wid)
 
-                # Phase 3: Check slots
                 n_subs = len(Config.VFS_SUBCATEGORIES)
                 total_checks = 2 * n_subs
                 check_num = 0
@@ -605,11 +626,6 @@ async def run_monitor():
                     for _sub_idx in range(n_subs):
                         check_num += 1
                         stats.checks_total += 1
-
-                        # Signal other worker before last check — it's already logged in, waiting
-                        if check_num == total_checks - 1 and not signaled:
-                            other_event.set()
-                            signaled = True
 
                         try:
                             found, info, screenshot = await checker.check_slots()
@@ -658,9 +674,12 @@ async def run_monitor():
                 logger.error("%s Ошибка: %s", tag, e, exc_info=True)
             finally:
                 await checker.close_browser()
-                if not signaled:
-                    other_event.set()
-                    signaled = True
+                # Signal other worker to start checking (and login if not yet)
+                if not signaled_login:
+                    other_login.set()
+                if not signaled_check:
+                    other_check.set()
+                    signaled_check = True
 
             if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
                 hot_mode_shared["active"] = False
