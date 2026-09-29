@@ -515,6 +515,7 @@ async def run_monitor():
             except asyncio.TimeoutError:
                 if not running:
                     break
+                continue
             my_event.clear()
 
             # Auto-unban accounts after 30 min cooldown
