@@ -1400,14 +1400,40 @@ class VFSBrowser:
 
         return False, " | ".join(results), None
 
+    async def _wait_please_wait_timer(self, max_wait: int = 60) -> None:
+        """Ждём пока таймер 'Please wait N seconds' исчезнет."""
+        for i in range(max_wait // 2):
+            remaining = await self.page.evaluate("""
+                (() => {
+                    const text = document.body.innerText || '';
+                    const m = text.match(/please wait (\\d+) second/i);
+                    return m ? parseInt(m[1]) : 0;
+                })()
+            """)
+            if not remaining or remaining <= 0:
+                if i > 0:
+                    logger.info("Таймер 'Please wait' завершился")
+                return
+            if i == 0:
+                logger.info("Обнаружен таймер: Please wait %d seconds", remaining)
+            await asyncio.sleep(2)
+        logger.warning("Таймер 'Please wait' не исчез за %dс", max_wait)
+
     async def _read_slot_result(self, subcategory: str) -> tuple[bool, str, str | None]:
         """Ждём результат проверки слотов и читаем его (API + DOM + Continue button)."""
         logger.info("Ждём результат проверки слотов...")
+
+        # Сначала дождёмся таймера "Please wait N seconds" если он появился
+        await self._wait_please_wait_timer()
+
         for wait_i in range(10):
             await self._delay(1.5, 2.5)
             ready = await self.page.evaluate("""
                 (() => {
                     const text = (document.body.innerText || '').toLowerCase();
+                    // Если таймер ещё на экране — ещё рано проверять
+                    if (/please wait \\d+ second/i.test(document.body.innerText || ''))
+                        return null;
                     if (text.includes('no appointment slots')) return 'no_slots';
                     const alert = document.querySelector('.Information [role="alert"], [role="alert"]');
                     if (alert && alert.textContent.toLowerCase().includes('no appointment')) return 'no_slots_dom';
@@ -1465,8 +1491,22 @@ class VFSBrowser:
             logger.info("Нет слотов (DOM alert) для '%s'", subcategory)
             return False, "Нет слотов", None
 
+        # Проверяем что таймер "Please wait" не активен
+        timer_active = await self.page.evaluate("""
+            (() => {
+                const text = document.body.innerText || '';
+                return /please wait \\d+ second/i.test(text);
+            })()
+        """)
+        if timer_active:
+            logger.info("Таймер 'Please wait' ещё активен — ждём")
+            await self._wait_please_wait_timer()
+
         continue_disabled = await self.page.evaluate("""
             (() => {
+                // Ещё раз проверяем таймер — если он есть, кнопка Continue не значит что слоты есть
+                if (/please wait \\d+ second/i.test(document.body.innerText || ''))
+                    return null;
                 const btns = document.querySelectorAll('button.btn-brand-orange, button.mat-mdc-raised-button');
                 for (const b of btns) {
                     if (b.textContent.toLowerCase().includes('continue')) {
