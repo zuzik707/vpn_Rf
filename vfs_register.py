@@ -61,6 +61,18 @@ class VFSRegistrar:
         os.makedirs(self._browser_data_dir, exist_ok=True)
         os.makedirs(Config.SCREENSHOT_DIR, exist_ok=True)
 
+        # Kill zombie Chrome processes using our data dir
+        try:
+            import subprocess
+            data_dir_name = os.path.basename(self._browser_data_dir)
+            result = subprocess.run(
+                ["pkill", "-f", f"--user-data-dir.*{data_dir_name}"],
+                capture_output=True, timeout=5)
+            if result.returncode == 0:
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
         for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
             lock_path = os.path.join(self._browser_data_dir, lock)
             if os.path.exists(lock_path):
@@ -103,12 +115,29 @@ class VFSRegistrar:
             self._local_proxy_server.close()
             self._local_proxy_server = None
         if self.browser:
+            # Try graceful stop first
+            pid = None
+            try:
+                if hasattr(self.browser, '_process') and self.browser._process:
+                    pid = self.browser._process.pid
+                elif hasattr(self.browser, 'process') and self.browser.process:
+                    pid = self.browser.process.pid
+            except Exception:
+                pass
             try:
                 result = self.browser.stop()
                 if asyncio.iscoroutine(result):
                     await result
             except Exception:
                 pass
+            # Force kill if process is still alive
+            if pid:
+                try:
+                    import signal
+                    os.kill(pid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+            await asyncio.sleep(1)
         self.browser = None
         self.page = None
 

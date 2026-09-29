@@ -451,11 +451,21 @@ class TelegramBot:
             fail = 0
             for i in range(count):
                 bot.send(f"Регистрация {i+1}/{count}...")
+                before = count_accounts(enabled_only=True)
                 bot._do_single_registration("")
+                after = count_accounts(enabled_only=True)
+                if after > before:
+                    ok += 1
+                else:
+                    fail += 1
                 if i < count - 1:
                     pause = random.uniform(30, 60)
+                    bot.send(f"[{ok} ok / {fail} fail] Пауза {pause:.0f}с...")
                     time.sleep(pause)
-            bot.send(f"Batch регистрация завершена: {count} попыток")
+            bot.send(f"Batch завершена!\n"
+                     f"Успешно: {ok}\n"
+                     f"Неудачно: {fail}\n"
+                     f"Всего аккаунтов: {count_accounts(enabled_only=True)}")
 
         t = threading.Thread(target=do_batch, daemon=True, name="batch-reg")
         t.start()
