@@ -376,8 +376,9 @@ class VFSRegistrar:
             """)
             logger.info("Form diagnostics: %s", diag)
 
-            # Ждём Turnstile (до 30 сек)
-            for _ in range(15):
+            # Ждём Turnstile (до 60 сек) — кликаем iframe если не решается
+            turnstile_ok = False
+            for ti in range(30):
                 token_ok = await self.page.evaluate("""
                     (() => {
                         const el = document.querySelector('[name="cf-turnstile-response"]');
@@ -386,8 +387,21 @@ class VFSRegistrar:
                 """)
                 if token_ok:
                     logger.info("Turnstile resolved for registration")
+                    turnstile_ok = True
                     break
-                await self._delay(1, 2)
+                # Every 10 iterations try clicking the turnstile checkbox
+                if ti % 10 == 5:
+                    await self.page.evaluate("""
+                        (() => {
+                            const iframe = document.querySelector('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]');
+                            if (iframe) { iframe.click(); }
+                            const widget = document.querySelector('.cf-turnstile, [data-sitekey]');
+                            if (widget) { widget.click(); }
+                        })()
+                    """)
+                await self._delay(1.5, 2.5)
+            if not turnstile_ok:
+                logger.warning("Turnstile NOT resolved after 60s")
 
             # Кликаем Submit/Register
             submitted = await self.page.evaluate("""

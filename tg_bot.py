@@ -257,77 +257,79 @@ class TelegramBot:
             # Без аргументов — создаём temp email автоматически
             self._run_registration("")
 
-    def _run_registration(self, email: str, prefix: str = ""):
+    def _do_single_registration(self, email: str, prefix: str = ""):
+        """Synchronous registration — blocks until done. Call from a thread."""
         if email:
             proxy = _make_proxy_for_account(email)
-            display = email
         else:
             proxy = _make_proxy_for_account(prefix or f"auto{int(time.time())}")
             display = "авто (mail.tm)"
 
         self.send(
             f"Регистрирую аккаунт на VFS...\n"
-            f"Email: <b>{display}</b>\n"
+            f"Email: <b>{email or display}</b>\n"
             f"Полный цикл: регистрация → письмо → активация\n"
             f"Это займёт 1-3 минуты"
         )
 
-        bot = self  # capture for closure
+        try:
+            from vfs_register import register_account
+            loop = asyncio.new_event_loop()
+            result = loop.run_until_complete(
+                register_account(
+                    email=email,
+                    proxy_url=proxy,
+                    auto_activate=True,
+                    progress_cb=self.send,
+                ))
+            loop.close()
 
-        def do_reg():
-            try:
-                from vfs_register import register_account
-                loop = asyncio.new_event_loop()
-                result = loop.run_until_complete(
-                    register_account(
-                        email=email,
-                        proxy_url=proxy,
-                        auto_activate=True,
-                        progress_cb=bot.send,
-                    ))
-                loop.close()
+            if result.get("success"):
+                final_email = result.get("email", email)
+                password = result["password"]
+                final_proxy = _make_proxy_for_account(final_email)
 
-                if result.get("success"):
-                    final_email = result.get("email", email)
-                    password = result["password"]
-                    final_proxy = _make_proxy_for_account(final_email)
+                if add_account(final_email, password, final_proxy):
+                    self._notify_accounts_changed()
 
-                    # Сохраняем в БД
-                    if add_account(final_email, password, final_proxy):
-                        bot._notify_accounts_changed()
+                activated = result.get("activated", False)
+                status = "АКТИВИРОВАН" if activated else "Нужна активация"
 
-                    activated = result.get("activated", False)
-                    status = "АКТИВИРОВАН" if activated else "Нужна активация"
-
-                    bot.send(
-                        f"Аккаунт готов!\n\n"
-                        f"Email: <code>{final_email}</code>\n"
-                        f"Пароль: <code>{password}</code>\n"
-                        f"Телефон: {result.get('phone', '?')}\n"
-                        f"Статус: <b>{status}</b>\n\n"
-                        f"{result.get('message', '')}\n\n"
-                        f"Сохранено в БД. Воркер запустится автоматически."
-                    )
-                    for key in ("screenshot", "activation_screenshot"):
-                        if result.get(key):
-                            try:
-                                send_telegram_photo(result[key], f"Рег. {final_email}")
-                            except Exception:
-                                pass
-                else:
-                    error = result.get("error", "Неизвестная ошибка")
-                    bot.send(f"Регистрация не удалась:\n<code>{error}</code>")
-                    if result.get("screenshot"):
+                self.send(
+                    f"Аккаунт готов!\n\n"
+                    f"Email: <code>{final_email}</code>\n"
+                    f"Пароль: <code>{password}</code>\n"
+                    f"Телефон: {result.get('phone', '?')}\n"
+                    f"Статус: <b>{status}</b>\n\n"
+                    f"{result.get('message', '')}\n\n"
+                    f"Сохранено в БД. Воркер запустится автоматически."
+                )
+                for key in ("screenshot", "activation_screenshot"):
+                    if result.get(key):
                         try:
-                            send_telegram_photo(result["screenshot"], "Ошибка регистрации")
+                            send_telegram_photo(result[key], f"Рег. {final_email}")
                         except Exception:
                             pass
+            else:
+                error = result.get("error", "Неизвестная ошибка")
+                self.send(f"Регистрация не удалась:\n<code>{error}</code>")
+                if result.get("screenshot"):
+                    try:
+                        send_telegram_photo(result["screenshot"], "Ошибка регистрации")
+                    except Exception:
+                        pass
 
-            except Exception as e:
-                logger.error("Registration thread error: %s", e, exc_info=True)
-                bot.send(f"Ошибка регистрации: <code>{e}</code>")
+        except Exception as e:
+            logger.error("Registration error: %s", e, exc_info=True)
+            self.send(f"Ошибка регистрации: <code>{e}</code>")
 
-        t = threading.Thread(target=do_reg, daemon=True, name=f"reg-{email or 'auto'}")
+    def _run_registration(self, email: str, prefix: str = ""):
+        """Start registration in a background thread (for single /reg)."""
+        t = threading.Thread(
+            target=self._do_single_registration,
+            args=(email, prefix),
+            daemon=True, name=f"reg-{email or 'auto'}",
+        )
         t.start()
 
     def _run_batch_registration(self, count: int):
@@ -335,16 +337,19 @@ class TelegramBot:
             self.send("Количество: от 1 до 30")
             return
         self.send(f"Запускаю регистрацию {count} аккаунтов последовательно...\n"
-                  f"Пауза 30-60с между каждым чтобы не словить 429")
+                  f"Каждый ждёт завершения предыдущего + пауза 30-60с")
 
         bot = self
         def do_batch():
+            ok = 0
+            fail = 0
             for i in range(count):
                 bot.send(f"Регистрация {i+1}/{count}...")
-                bot._run_registration("")
+                bot._do_single_registration("")
                 if i < count - 1:
                     pause = random.uniform(30, 60)
                     time.sleep(pause)
+            bot.send(f"Batch регистрация завершена: {count} попыток")
 
         t = threading.Thread(target=do_batch, daemon=True, name="batch-reg")
         t.start()
