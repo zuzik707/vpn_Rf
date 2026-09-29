@@ -256,7 +256,7 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
             logger.error("%s Логин не удался после 3 попыток", tag)
             await asyncio.to_thread(notify_error, f"{tag} Логин не удался после 3 попыток. Проверь proxy/credentials.")
         else:
-            # Pause after login before first check — human doesn't immediately start clicking
+            await asyncio.to_thread(notify_status, f"{tag} залогинился, начинаю проверку слотов")
             post_login_pause = random.uniform(30, 90)
             logger.info("%s Пауза %.0fс после логина", tag, post_login_pause)
             await asyncio.sleep(post_login_pause)

@@ -370,11 +370,11 @@ class VFSBrowser:
         except Exception:
             return ""
 
-    async def _screenshot(self, tag: str, send_tg: bool = True) -> str:
+    async def _screenshot(self, tag: str, send_tg: bool = False) -> str:
         path = os.path.join(Config.SCREENSHOT_DIR, f"{tag}_{int(time.time())}.png")
         try:
             await self.page.save_screenshot(path)
-            logger.info("Screenshot: %s", path)
+            logger.debug("Screenshot: %s", path)
             if send_tg and os.path.exists(path):
                 send_telegram_photo(path, f"[W{self.worker_id}] {tag}")
         except Exception as e:
@@ -832,7 +832,7 @@ class VFSBrowser:
         if state == "blocked":
             text = await self._text()
             logger.error("BLOCKED! %s", text[:200])
-            await self._screenshot("blocked")
+            await self._screenshot("blocked", send_tg=True)
             await dump_page(self.page, "blocked")
             self.cf_fail_count += 3
             # Detect VFS account ban
@@ -1438,7 +1438,7 @@ class VFSBrowser:
         if self.interceptor.has_data:
             api_result = await self.interceptor.check_api_slots()
             if api_result.available:
-                screenshot = await self._screenshot("slots_found")
+                screenshot = await self._screenshot("slots_found", send_tg=True)
                 info = f"API: слоты найдены!"
                 if api_result.earliest_date:
                     info += f" Ближайшая дата: {api_result.earliest_date}"
@@ -1479,7 +1479,7 @@ class VFSBrowser:
         """)
 
         if continue_disabled is False:
-            screenshot = await self._screenshot("slots_found")
+            screenshot = await self._screenshot("slots_found", send_tg=True)
             logger.info("СЛОТЫ НАЙДЕНЫ для '%s'!", subcategory)
             date_info = await self.page.evaluate("""
                 (() => {
