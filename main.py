@@ -138,7 +138,8 @@ def validate_config() -> list[str]:
     return missing
 
 
-def get_sleep_interval(consecutive_errors: int, hot_mode: bool, cf_backoff: bool = False) -> float:
+def get_sleep_interval(consecutive_errors: int, hot_mode: bool,
+                       cf_backoff: bool = False, total_workers: int = 1) -> float:
     if hot_mode:
         base = random.uniform(Config.CHECK_INTERVAL_HOT_MIN, Config.CHECK_INTERVAL_HOT_MAX)
     elif is_daytime():
@@ -146,14 +147,19 @@ def get_sleep_interval(consecutive_errors: int, hot_mode: bool, cf_backoff: bool
     else:
         base = random.uniform(Config.CHECK_INTERVAL_NIGHT_MIN, Config.CHECK_INTERVAL_NIGHT_MAX)
 
+    # With many workers each individual needs to check less often
+    # 25 workers × 600s each = one check every 24s across all accounts
+    if total_workers > 3:
+        base *= max(total_workers / 3, 1.0)
+
     if consecutive_errors > 0:
         base *= 1.5 ** min(consecutive_errors, 5)
-        base = min(base, 1200)
+        base = min(base, 3600)
 
     if cf_backoff:
         base = max(base, 120)
 
-    # Jitter ±40% (друг рекомендовал, а не ±15%)
+    # Jitter ±40%
     jitter = base * random.uniform(-0.4, 0.4)
     return base + jitter
 
@@ -192,7 +198,8 @@ def cleanup_screenshots() -> int:
 
 
 async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
-                     stats: SessionStats, hot_mode_until_shared: dict):
+                     stats: SessionStats, hot_mode_until_shared: dict,
+                     total_workers_ref: dict | None = None):
     """Single account worker — runs in its own Chrome instance."""
     email = acct["email"]
     proxy_url = acct.get("proxy", "")
@@ -208,9 +215,9 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
     logger.info("%s Старт воркера (proxy=%s)", tag,
                 proxy_url.split("@")[-1] if "@" in proxy_url else (proxy_url[:30] or "none"))
 
-    # Stagger start: each worker waits worker_id * 15-30s to avoid simultaneous launches
+    # Stagger start: spread workers over time to avoid simultaneous launches
     if worker_id > 0:
-        stagger = worker_id * random.uniform(15, 30)
+        stagger = worker_id * random.uniform(30, 60)
         logger.info("%s Stagger start: %.0fс", tag, stagger)
         await asyncio.sleep(stagger)
 
@@ -332,10 +339,12 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
                     await asyncio.sleep(random.uniform(300, 600))
                     continue
 
+            n_workers = total_workers_ref.get("count", 1) if total_workers_ref else 1
             sleep_time = get_sleep_interval(
                 consecutive_errors,
                 hot_mode_until_shared.get("active", False),
                 cf_backoff=checker.should_backoff,
+                total_workers=n_workers,
             )
             # Soft start: first 5 checks use 2-3x longer intervals
             if checks_since_login <= 5:
@@ -411,6 +420,7 @@ async def run_monitor():
 
     hot_mode_shared = {"until": 0.0, "active": False}
     worker_tasks: dict[str, asyncio.Task] = {}
+    workers_count = {"count": n}
 
     # Telegram бот для управления аккаунтами
     tg_bot = None
@@ -462,8 +472,9 @@ async def run_monitor():
                         acct["proxy"] = Config.PROXY_URL
                     wid = len(worker_tasks)
                     logger.info("Новый воркер для %s (W%d)", acct["email"], wid)
+                    workers_count["count"] = len(active_emails) + 1
                     t = asyncio.create_task(
-                        run_worker(wid, acct, solver, budget, stats, hot_mode_shared))
+                        run_worker(wid, acct, solver, budget, stats, hot_mode_shared, workers_count))
                     worker_tasks[acct["email"]] = t
 
             if time.time() - last_hb >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
@@ -499,7 +510,7 @@ async def run_monitor():
         tasks.append(asyncio.create_task(heartbeat_loop()))
         for i, acct in enumerate(accounts):
             t = asyncio.create_task(
-                run_worker(i, acct, solver, budget, stats, hot_mode_shared))
+                run_worker(i, acct, solver, budget, stats, hot_mode_shared, workers_count))
             tasks.append(t)
             worker_tasks[acct["email"]] = t
 

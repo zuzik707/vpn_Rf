@@ -21,6 +21,7 @@ VFS Global Slot Checker — точно под visa.vfsglobal.com/uzb/en/lva
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -82,6 +83,7 @@ class VFSBrowser:
         self.email = email or Config.VFS_EMAIL
         self.password = password or Config.VFS_PASSWORD
         self.proxy_url = proxy_url or Config.PROXY_URL
+        self._assign_sticky_session()
         self.worker_id = worker_id
         self._browser_data_dir = os.path.join(
             os.path.dirname(__file__), f"browser_data_{worker_id}")
@@ -101,6 +103,22 @@ class VFSBrowser:
         self.cf_fail_count: int = 0
         self.banned: bool = False
         self.ban_reason: str = ""
+
+    def _assign_sticky_session(self) -> None:
+        """Assign a unique Bright Data sticky session based on email hash.
+        Each account gets its own persistent IP."""
+        if not self.proxy_url:
+            return
+        if "brd.superproxy.io" not in self.proxy_url and "brightdata" not in self.proxy_url:
+            return
+        import re
+        base = re.sub(r'-session-[^:@]+', '', self.proxy_url)
+        session_id = hashlib.md5(self.email.encode()).hexdigest()[:12]
+        at_idx = base.find('@')
+        if at_idx == -1:
+            return
+        colon_idx = base.rfind(':', 0, at_idx)
+        self.proxy_url = base[:colon_idx] + f"-session-{session_id}" + base[colon_idx:]
 
     def set_credentials(self, email: str, password: str) -> None:
         self.email = email
