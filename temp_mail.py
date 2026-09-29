@@ -76,30 +76,49 @@ class TempMailClient:
         self.address = f"{prefix}@{domain}"
         self.password = f"TmpPass_{int(time.time())}!"
 
-        # Создаём аккаунт
-        resp = self._session.post(
-            f"{BASE_URL}/accounts",
-            json={"address": self.address, "password": self.password},
-            timeout=10,
-        )
-        if resp.status_code == 422:
-            # Адрес занят — пробуем с рандомным суффиксом
-            self.address = f"{prefix}{random.randint(100,999)}@{domain}"
+        # Создаём аккаунт (до 3 попыток с разными адресами)
+        created = False
+        for attempt in range(3):
             resp = self._session.post(
                 f"{BASE_URL}/accounts",
                 json={"address": self.address, "password": self.password},
                 timeout=10,
             )
-        resp.raise_for_status()
+            if resp.status_code in (200, 201):
+                created = True
+                break
+            if resp.status_code == 422:
+                # Адрес занят — генерируем новый
+                prefix = _random_human_prefix()
+                self.address = f"{prefix}@{domain}"
+                continue
+            resp.raise_for_status()
 
-        # Получаем токен
-        resp = self._session.post(
-            f"{BASE_URL}/token",
-            json={"address": self.address, "password": self.password},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        self.token = resp.json()["token"]
+        if not created:
+            raise RuntimeError(f"Не удалось создать аккаунт за 3 попытки (последний: {self.address})")
+
+        # Получаем токен (retry если 401 — иногда задержка между созданием и авторизацией)
+        token_resp = None
+        for _ in range(3):
+            token_resp = self._session.post(
+                f"{BASE_URL}/token",
+                json={"address": self.address, "password": self.password},
+                timeout=10,
+            )
+            if token_resp.status_code == 200:
+                break
+            if token_resp.status_code == 401:
+                logger.debug("Token 401 — retrying in 2s...")
+                time.sleep(2)
+                continue
+            token_resp.raise_for_status()
+
+        if not token_resp or token_resp.status_code != 200:
+            raise RuntimeError(
+                f"mail.tm token failed ({token_resp.status_code if token_resp else '?'}): "
+                f"{token_resp.text[:200] if token_resp else 'no response'}")
+
+        self.token = token_resp.json()["token"]
         self._session.headers["Authorization"] = f"Bearer {self.token}"
 
         logger.info("Temp email created: %s", self.address)
