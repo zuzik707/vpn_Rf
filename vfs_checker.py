@@ -143,10 +143,10 @@ class VFSBrowser:
             if "://" not in proxy_for_curl:
                 proxy_for_curl = f"http://{proxy_for_curl}"
             result = subprocess.run(
-                ["curl", "-x", proxy_for_curl, "-s", "--max-time", "15",
+                ["curl", "-x", proxy_for_curl, "-s", "--max-time", "8",
                  "-o", "/dev/null", "-w", "%{http_code}",
                  "https://visa.vfsglobal.com/uzb/en/lva"],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=12,
             )
             code = result.stdout.strip()
             if result.returncode == 0 and code and code != "000":
@@ -1165,7 +1165,7 @@ class VFSBrowser:
         if not warmed:
             logger.warning("Warming failed, прямой заход")
             await self.page.get(Config.VFS_URL)
-        await self._delay(5, 10)
+        await self._delay(2, 4)
         await self._screenshot("after_warming")
 
         # Check for proxy/network failure after warming
@@ -1301,7 +1301,7 @@ class VFSBrowser:
 
                 # Invisible Turnstile on login form — wait for auto-solve first
                 token_ready = False
-                for _tw in range(15):
+                for _tw in range(8):
                     token_ready = await self.page.evaluate("""
                         (() => {
                             const el = document.querySelector('[name="cf-turnstile-response"]');
@@ -1309,7 +1309,7 @@ class VFSBrowser:
                         })()
                     """)
                     if token_ready:
-                        logger.info("Turnstile auto-solved (wait %ds)", _tw + 1)
+                        logger.info("Turnstile auto-solved (wait %ds)", _tw * 2)
                         break
                     await asyncio.sleep(2)
 
@@ -1351,7 +1351,7 @@ class VFSBrowser:
                     if not clicked:
                         await pwd_el.send_keys("\r")
 
-                await self._delay(6, 12)
+                await self._delay(4, 7)
                 await self._screenshot("after_signin_click")
                 state = await self._page_state()
 
