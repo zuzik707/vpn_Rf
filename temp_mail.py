@@ -15,15 +15,52 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.mail.tm"
 
 _FIRST_NAMES = [
+    # Uzbek female
+    "aziza", "barno", "charos", "dilnoza", "dilorom", "durdona", "feruza",
+    "gavhar", "gulnara", "gulnoza", "gulshan", "hilola", "hulkar", "iroda",
+    "kamila", "komila", "lola", "madina", "mahliyo", "malika", "manzura",
+    "marguba", "mavluda", "mohira", "muazzam", "munira", "nafisa", "nargiza",
+    "nasiba", "nigora", "nilufar", "nodira", "nozima", "ozoda", "parizod",
+    "rano", "robiya", "rohila", "sabohat", "sadoqat", "saida", "sarvinoz",
+    "sevinch", "shahlo", "shakhnoza", "shoira", "sitora", "saodat", "turgunoy",
+    "umida", "venera", "yulduz", "zamira", "zarina", "zebiniso", "zulfiya",
+    # Uzbek male
+    "abdulla", "akbar", "akmal", "alisher", "anvar", "asror", "azam",
+    "bahrom", "bakhodir", "behruz", "bobur", "botir", "daler", "davron",
+    "dilshod", "doston", "eldor", "elmurod", "farhod", "farkhad", "firuz",
+    "husan", "ikrom", "ilhom", "islom", "jamshid", "jasur", "javlon",
+    "kamoliddin", "kozim", "laziz", "lochin", "mansur", "mirzo", "murod",
+    "muzaffar", "navruz", "nodirjon", "nodir", "obid", "odil", "otabek",
+    "ravshan", "rustam", "sanjar", "sardor", "sherzod", "sirojiddin",
+    "suhrab", "tahir", "temur", "timur", "tohir", "tulkin", "ulugbek",
+    "umid", "vohid", "yusuf", "zafar", "zohid",
+    # International common
     "anna", "maria", "elena", "olga", "nina", "diana", "alina", "daria",
     "ivan", "alex", "dmitry", "artem", "nikita", "sergey", "pavel", "denis",
-    "kamila", "aziza", "nodira", "dilnoza", "jasur", "bobur", "sardor", "timur",
     "kate", "julia", "lena", "max", "daniel", "mark", "lucas", "emma",
+    "sophia", "victoria", "natasha", "vera", "irina", "ksenia", "tatiana",
+    "andrey", "mikhail", "roman", "viktor", "oleg", "boris", "igor",
+    "amir", "omar", "sara", "layla", "hassan", "fatima", "yusuf", "rania",
+    "james", "john", "robert", "michael", "david", "sarah", "jennifer",
+    "lisa", "laura", "karen", "thomas", "william", "richard", "joseph",
 ]
 _LAST_NAMES = [
+    # Uzbek
+    "abdullaev", "ahmedov", "aliev", "askarov", "ataev", "azimov",
+    "babaev", "bahriddinov", "botirov", "djuraev", "ergashev", "eshmatov",
+    "gafurov", "ganiev", "hamidov", "hasanov", "holmatov", "ibragimov",
+    "inomov", "iskandarov", "ismoilov", "kamolov", "karimov", "khamraev",
+    "khodjaev", "komilov", "latipov", "mahmudov", "mamatov", "mirzaev",
+    "murodov", "nabiev", "nazarov", "nishanov", "normatov", "nurov",
+    "oblokulov", "ortikov", "otajonov", "pardaev", "qodirov", "rahimov",
+    "rashidov", "ruziev", "sadikov", "salimov", "sobirov", "sultanov",
+    "tashmatov", "toshpulatov", "turaev", "turobov", "umarov", "usmanov",
+    "yuldashev", "yusupov", "zakirov", "zokirov",
+    # International
     "kim", "lee", "park", "chen", "wang", "khan", "ali", "ahmed",
     "smith", "jones", "miller", "davis", "wilson", "taylor", "moore", "clark",
-    "karimov", "aliev", "umarov", "nazarov", "rashidov", "sultanov",
+    "brown", "johnson", "williams", "anderson", "martinez", "garcia", "lopez",
+    "petrov", "ivanov", "smirnov", "kuznetsov", "popov", "sokolov", "novikov",
 ]
 
 
