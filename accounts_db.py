@@ -112,6 +112,7 @@ def get_scout_accounts() -> list[dict]:
         rows = conn.execute(
             "SELECT email, password, proxy, fail_count, last_used, added_at, mail_password "
             "FROM accounts WHERE enabled = 1 AND (role = 'scout' OR role = '' OR role IS NULL) "
+            "AND (notes NOT LIKE '%BANNED%' OR notes IS NULL) "
             "ORDER BY last_used ASC"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -160,7 +161,9 @@ def get_enabled_accounts() -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT email, password, proxy, fail_count, last_used, added_at, mail_password "
-            "FROM accounts WHERE enabled = 1 ORDER BY last_used ASC"
+            "FROM accounts WHERE enabled = 1 "
+            "AND (notes NOT LIKE '%BANNED%' OR notes IS NULL) "
+            "ORDER BY last_used ASC"
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -237,6 +240,16 @@ def get_banned_accounts() -> list[dict]:
             "ORDER BY added_at DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def purge_banned_accounts() -> int:
+    conn = _conn()
+    try:
+        cur = conn.execute("DELETE FROM accounts WHERE notes LIKE '%BANNED%'")
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 

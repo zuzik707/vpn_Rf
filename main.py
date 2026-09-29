@@ -29,7 +29,7 @@ from datetime import datetime, timezone, timedelta
 from accounts_db import (
     get_enabled_accounts, import_from_env, count_accounts, remove_account,
     add_account, get_fighter_accounts, get_applicants, mark_applicant_booked,
-    get_scout_accounts,
+    get_scout_accounts, purge_banned_accounts,
 )
 from budget_guard import BudgetGuard
 from config import Config
@@ -256,8 +256,10 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
 
         if not login_ok:
             stats.logins_failed += 1
-            logger.error("%s Логин не удался после 3 попыток", tag)
-            await asyncio.to_thread(notify_error, f"{tag} Логин не удался после 3 попыток. Проверь proxy/credentials.")
+            remove_account(email)
+            logger.error("%s Логин не удался 3 раза — УДАЛЁН из БД: %s", tag, email)
+            await asyncio.to_thread(notify_error,
+                f"🗑 {tag} 3 неудачных логина — удалён из БД. Replenisher создаст замену.")
             await checker.close_browser()
             return
         else:
@@ -405,6 +407,11 @@ async def run_monitor():
         imported = import_from_env(Config.VFS_ACCOUNTS)
         if imported:
             logger.info("Импортировано %d аккаунтов из .env в БД", imported)
+
+    # Очистка забаненных аккаунтов при старте
+    purged = purge_banned_accounts()
+    if purged:
+        logger.info("🗑 Удалено %d забаненных аккаунтов из БД при старте", purged)
 
     # Загружаем аккаунты из БД
     accounts = get_enabled_accounts()
@@ -581,9 +588,15 @@ async def run_monitor():
                     stats.logins_failed += 1
                     login_fails[email] = login_fails.get(email, 0) + 1
                     logger.warning("%s Логин не удался (fail #%d)", tag, login_fails[email])
-                    if login_fails[email] >= 2:
+                    if login_fails[email] >= 3:
+                        remove_account(email)
                         banned_emails[email] = time.time()
-                        logger.warning("%s 2+ login fails — пауза 30 мин для %s", tag, email.split('@')[0])
+                        logger.error("%s 3 login fails — УДАЛЁН из БД: %s", tag, email.split('@')[0])
+                        await asyncio.to_thread(notify_error,
+                            f"🗑 {email.split('@')[0]}: 3 неудачных логина — удалён из БД")
+                    elif login_fails[email] >= 2:
+                        banned_emails[email] = time.time()
+                        logger.warning("%s 2 login fails — пауза 30 мин для %s", tag, email.split('@')[0])
                         await asyncio.to_thread(notify_status,
                             f"⏸ {email.split('@')[0]}: 2 неудачных логина — пауза 30 мин")
                     consecutive_errors += 1
