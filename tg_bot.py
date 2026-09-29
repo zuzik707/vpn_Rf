@@ -283,6 +283,8 @@ class TelegramBot:
             self._cmd_set_fighter(chat_id, arg)
         elif cmd == "/fighters":
             self._cmd_list_fighters()
+        elif cmd == "/attack":
+            self._cmd_attack()
         elif cmd in ("/help", "/start"):
             self._cmd_help()
         elif cmd == "/cancel":
@@ -974,6 +976,26 @@ class TelegramBot:
         else:
             self.send(f"Человек #{aid} не найден")
 
+    def _cmd_attack(self):
+        """Manual attack trigger — shows fighters status and signals attack_callback."""
+        fighters = get_fighter_accounts()
+        applicants = get_applicants(unbooked_only=True)
+        if not fighters:
+            self.send("Нет бойцов! Назначь через /setfighter")
+            return
+        if not applicants:
+            self.send("Все люди уже забронированы! Добавь через /person или сбрось /resetbook")
+            return
+        persons = {a["id"]: a for a in applicants}
+        linked = sum(1 for f in fighters if f.get("applicant_id") in persons)
+        self.send(
+            f"ATTACK MODE\n"
+            f"Бойцов: {len(fighters)} ({linked} привязаны к незабронированным)\n"
+            f"Людей без брони: {len(applicants)}\n\n"
+            f"Атака запускается автоматически при обнаружении слотов скаутами.\n"
+            f"Слоты сейчас не обнаружены — бойцы ждут сигнала."
+        )
+
     def _cmd_cleanbans(self):
         banned = get_banned_accounts()
         if not banned:
@@ -1005,6 +1027,11 @@ class TelegramBot:
             "/persons — список людей\n"
             "/delperson ID — удалить\n"
             "/resetbook ID — сбросить бронь\n\n"
+            "<b>Роли:</b>\n"
+            "/setscout email — сделать скаутом\n"
+            "/setfighter email ID — сделать бойцом\n"
+            "/fighters — список бойцов\n"
+            "/attack — ручной запуск атаки\n\n"
             "<b>Статус:</b>\n"
             "/status — мониторинг\n"
             "/verify — проверить аккаунты\n"

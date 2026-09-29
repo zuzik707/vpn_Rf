@@ -39,6 +39,7 @@ from human_clicker import HumanClicker
 from network_interceptor import NetworkInterceptor
 from local_proxy import start_local_proxy, get_local_proxy_url, DEFAULT_PORT
 from notifier import send_telegram_photo
+from otp_reader import get_vfs_otp
 from session_warmer import SessionWarmer
 
 logger = logging.getLogger(__name__)
@@ -1827,3 +1828,782 @@ class VFSBrowser:
         if not self.logged_in:
             return False
         return (time.time() - self.last_login_time) < self._session_ttl
+
+    # ══════════════════════════════════════════════════════════════
+    #  FIGHTER AUTO-BOOKING FLOW (Steps 1-5)
+    # ══════════════════════════════════════════════════════════════
+
+    async def auto_book(self, passport_path: str, applicant_name: str,
+                        mail_password: str = "", subcategory: str = "") -> dict:
+        """
+        Full auto-booking flow for fighter accounts.
+        Returns dict: {success: bool, step: str, error: str, booked_date: str, booked_time: str}
+        """
+        result = {"success": False, "step": "", "error": "", "booked_date": "", "booked_time": ""}
+        sub = subcategory or Config.VFS_SUBCATEGORIES[0]
+
+        try:
+            # Step 0: Login
+            result["step"] = "login"
+            if not self.logged_in:
+                if not await self.login():
+                    result["error"] = "Login failed"
+                    return result
+            logger.info("[F%d] Login OK for %s, starting booking for %s",
+                        self.worker_id, self.email, applicant_name)
+
+            # Step 1: Navigate to appointment form and select dropdowns
+            result["step"] = "step1_appointment"
+            if not await self._ensure_dashboard():
+                result["error"] = "Cannot reach dashboard"
+                return result
+
+            # Click Start New Booking
+            await self._delay(1, 2)
+            snb_el = await self._find_input([
+                "button.btn-brand-orange.mat-mdc-raised-button",
+                "button.btn-brand-orange",
+            ])
+            if snb_el:
+                if self.hc:
+                    await self.hc.click(snb_el)
+                else:
+                    await snb_el.click()
+            else:
+                await self.page.evaluate("""
+                    (() => {
+                        for (const b of document.querySelectorAll('button, a')) {
+                            if (b.textContent.toLowerCase().includes('start new booking')) {
+                                b.click(); return true;
+                            }
+                        }
+                        return false;
+                    })()
+                """)
+            await self._delay(3, 5)
+            if not await self._handle_obstacle():
+                result["error"] = "Obstacle after Start New Booking"
+                return result
+
+            # Select Centre → Category → Sub-category
+            if not await self._select_dropdown_option("Application Centre", Config.VFS_CENTRE):
+                result["error"] = "Cannot select Centre"
+                return result
+            await self._delay(1.5, 3)
+
+            if not await self._select_dropdown_option("appointment category", Config.VFS_CATEGORY):
+                result["error"] = "Cannot select Category"
+                return result
+            await self._delay(1.5, 3)
+
+            if not await self._select_dropdown_option("sub-category", sub):
+                result["error"] = "Cannot select Sub-category"
+                return result
+
+            # Wait for slot check result
+            found, info, _ = await self._read_slot_result(sub)
+            if not found:
+                result["error"] = f"No slots available: {info}"
+                return result
+            logger.info("[F%d] Slots confirmed! Advancing to step 2...", self.worker_id)
+
+            # Click Continue (step 1 → step 2) + wait timer
+            result["step"] = "step1_continue"
+            if not await self._fighter_click_continue_step1():
+                result["error"] = "Cannot click Continue on step 1"
+                return result
+
+            # Step 2: Upload passport + OCR + Save + OTP
+            result["step"] = "step2_passport"
+            if not await self._fighter_upload_passport(passport_path):
+                result["error"] = "Passport upload failed"
+                return result
+
+            result["step"] = "step2_form"
+            if not await self._fighter_wait_ocr_and_save():
+                result["error"] = "OCR/form save failed"
+                return result
+
+            result["step"] = "step2_otp"
+            if not await self._fighter_verify_otp(mail_password):
+                result["error"] = "OTP verification failed"
+                return result
+
+            # Step 3: Select date and time
+            result["step"] = "step3_date"
+            date_str, time_str = await self._fighter_select_date_time()
+            if not date_str:
+                result["error"] = "Cannot select date/time"
+                return result
+            result["booked_date"] = date_str
+            result["booked_time"] = time_str
+            logger.info("[F%d] Selected %s %s", self.worker_id, date_str, time_str)
+
+            # Step 4: Services — skip (just Continue)
+            result["step"] = "step4_services"
+            if not await self._fighter_skip_services():
+                result["error"] = "Cannot skip services"
+                return result
+
+            # Step 5: Review — Confirm
+            result["step"] = "step5_confirm"
+            if not await self._fighter_confirm():
+                result["error"] = "Confirmation failed"
+                return result
+
+            result["success"] = True
+            logger.info("[F%d] BOOKING CONFIRMED for %s! Date: %s Time: %s",
+                        self.worker_id, applicant_name, date_str, time_str)
+            await self._screenshot("booking_success", send_tg=True)
+            return result
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error("[F%d] Auto-book error at %s: %s",
+                         self.worker_id, result["step"], e, exc_info=True)
+            await self._screenshot(f"fighter_error_{result['step']}")
+            return result
+
+    async def _fighter_click_continue_step1(self) -> bool:
+        """Click Continue on step 1, wait through 'Please wait N seconds' timer."""
+        clicked = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    if (b.textContent.toLowerCase().includes('continue') && !b.disabled &&
+                        !b.classList.contains('mat-mdc-button-disabled')) {
+                        b.click(); return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+        if not clicked:
+            logger.warning("[F%d] Continue button not clickable on step 1", self.worker_id)
+            return False
+
+        logger.info("[F%d] Waiting for 'Please wait' timer...", self.worker_id)
+        for _ in range(40):
+            await asyncio.sleep(2)
+            timer_val = await self.page.evaluate("""
+                (() => {
+                    const text = document.body.innerText || '';
+                    const m = text.match(/please wait (\\d+) second/i);
+                    return m ? parseInt(m[1]) : 0;
+                })()
+            """)
+            if timer_val and timer_val > 0:
+                logger.info("[F%d] Timer: %ds remaining...", self.worker_id, timer_val)
+                continue
+
+            on_step2 = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('your details') || text.includes('browse files') ||
+                           text.includes('passport') || text.includes('upload');
+                })()
+            """)
+            if on_step2:
+                logger.info("[F%d] On step 2 (Your Details)", self.worker_id)
+                return True
+
+        await self._screenshot("step1_timer_timeout")
+        return False
+
+    async def _fighter_upload_passport(self, passport_path: str) -> bool:
+        """Upload passport file via hidden input[type=file], then click Continue."""
+        if not os.path.exists(passport_path):
+            logger.error("[F%d] Passport file not found: %s", self.worker_id, passport_path)
+            return False
+
+        await self._delay(1, 2)
+
+        # Set the file on the hidden input[type=file]
+        file_input = await self.page.select('input[type="file"]')
+        if not file_input:
+            logger.error("[F%d] File input not found", self.worker_id)
+            await self._screenshot("no_file_input")
+            return False
+
+        await file_input.send_file(passport_path)
+        logger.info("[F%d] Passport file sent: %s", self.worker_id, os.path.basename(passport_path))
+        await self._delay(3, 5)
+
+        # Wait for file to appear + Click "Continue" button in the upload area
+        for attempt in range(10):
+            uploaded = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('replace') || text.includes('uploaded') ||
+                           text.includes('.pdf') || text.includes('.jpg') || text.includes('.png');
+                })()
+            """)
+            if uploaded:
+                break
+            await asyncio.sleep(2)
+
+        # Click "Continue" in upload area (button.file-browse.fs-22 with text "Continue")
+        clicked = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button.file-browse, button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t === 'continue' && (b.classList.contains('file-browse') ||
+                        b.classList.contains('fs-22') ||
+                        b.closest('.upload-container, .file-upload, .document-upload'))) {
+                        b.click(); return 'upload_continue';
+                    }
+                }
+                // Fallback: any Continue button that's not the main step Continue
+                for (const b of btns) {
+                    if (b.textContent.trim().toLowerCase() === 'continue' &&
+                        !b.classList.contains('btn-brand-orange') &&
+                        !b.classList.contains('mat-mdc-raised-button')) {
+                        b.click(); return 'fallback_continue';
+                    }
+                }
+                return null;
+            })()
+        """)
+        logger.info("[F%d] Upload continue click: %s", self.worker_id, clicked)
+        await self._delay(3, 5)
+        await self._screenshot("after_passport_upload")
+        return bool(clicked)
+
+    async def _fighter_wait_ocr_and_save(self) -> bool:
+        """Wait for VFS OCR to fill form fields, then click Save, then Continue on summary."""
+        # Wait for OCR to process and fill fields (fields become disabled)
+        logger.info("[F%d] Waiting for OCR to fill form...", self.worker_id)
+        for _ in range(20):
+            await asyncio.sleep(2)
+            ocr_done = await self.page.evaluate("""
+                (() => {
+                    // Check if form fields are filled and disabled (OCR completed)
+                    const inputs = document.querySelectorAll(
+                        'input[formcontrolname], input[matinput]'
+                    );
+                    let filled = 0;
+                    let disabled = 0;
+                    for (const inp of inputs) {
+                        if (inp.value && inp.value.trim()) filled++;
+                        if (inp.disabled || inp.readOnly) disabled++;
+                    }
+                    // OCR fills at least first name, last name, passport number
+                    return filled >= 3 && disabled >= 3;
+                })()
+            """)
+            if ocr_done:
+                logger.info("[F%d] OCR completed, fields filled", self.worker_id)
+                break
+
+        await self._delay(1, 2)
+        await self._screenshot("after_ocr")
+
+        # Check if contact number fields need filling (they might not be auto-filled)
+        await self.page.evaluate("""
+            (() => {
+                // Country code field — set to +998 (Uzbekistan) if empty
+                const codeInputs = document.querySelectorAll(
+                    'input[maxlength="3"], input[formcontrolname*="code"], input[placeholder*="code"]'
+                );
+                for (const inp of codeInputs) {
+                    if (!inp.value || !inp.value.trim()) {
+                        const nv = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value');
+                        nv.set.call(inp, '998');
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }
+                // Phone number — set dummy if empty (VFS requires it but doesn't verify)
+                const phoneInputs = document.querySelectorAll(
+                    'input[maxlength="15"], input[formcontrolname*="contact"], input[formcontrolname*="phone"]'
+                );
+                for (const inp of phoneInputs) {
+                    if (!inp.value || !inp.value.trim()) {
+                        const nv = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value');
+                        nv.set.call(inp, '901234567');
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                }
+            })()
+        """)
+        await self._delay(0.5, 1)
+
+        # Click Save button
+        save_clicked = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t === 'save' || t === 'save details' || t === 'save & continue') {
+                        if (!b.disabled) { b.click(); return true; }
+                    }
+                }
+                // Fallback: mat-raised-button with save text
+                for (const b of document.querySelectorAll('button[mat-raised-button], button.mat-mdc-raised-button')) {
+                    if (b.textContent.trim().toLowerCase().includes('save')) {
+                        b.click(); return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+        if not save_clicked:
+            logger.warning("[F%d] Save button not found", self.worker_id)
+            await self._screenshot("no_save_button")
+            return False
+
+        logger.info("[F%d] Save clicked", self.worker_id)
+        await self._delay(3, 5)
+
+        # Wait for "Your Details Summary" page with Continue button
+        for _ in range(10):
+            on_summary = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('your details summary') || text.includes('applicant 1') ||
+                           text.includes('summary');
+                })()
+            """)
+            if on_summary:
+                break
+            await asyncio.sleep(2)
+
+        await self._screenshot("details_summary")
+
+        # Click Continue on summary page
+        clicked = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t === 'continue' && !b.disabled) {
+                        b.click(); return true;
+                    }
+                }
+                // Orange continue button
+                const orange = document.querySelector('button.btn-brand-orange:not([disabled])');
+                if (orange && orange.textContent.toLowerCase().includes('continue')) {
+                    orange.click(); return true;
+                }
+                return false;
+            })()
+        """)
+        if not clicked:
+            logger.warning("[F%d] Summary Continue not found", self.worker_id)
+            return False
+
+        logger.info("[F%d] Summary Continue clicked, heading to OTP", self.worker_id)
+        await self._delay(3, 5)
+        return True
+
+    async def _fighter_verify_otp(self, mail_password: str = "") -> bool:
+        """Generate OTP, read from email, verify, click Continue."""
+        # Wait for OTP page
+        for _ in range(10):
+            on_otp = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('one-time password') || text.includes('otp') ||
+                           text.includes('generate otp');
+                })()
+            """)
+            if on_otp:
+                break
+            await asyncio.sleep(2)
+
+        await self._screenshot("otp_page")
+
+        # Click "Generate OTP" button
+        gen_clicked = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t.includes('generate') && t.includes('otp')) {
+                        if (!b.disabled) { b.click(); return true; }
+                    }
+                }
+                return false;
+            })()
+        """)
+        if not gen_clicked:
+            logger.error("[F%d] Generate OTP button not found", self.worker_id)
+            await self._screenshot("no_generate_otp")
+            return False
+
+        logger.info("[F%d] Generate OTP clicked, polling email for %s...",
+                    self.worker_id, self.email)
+        await self._delay(2, 3)
+
+        # Poll email for OTP (3 min expiry — we have 90s timeout)
+        otp = await get_vfs_otp(self.email, mail_password=mail_password, timeout=90)
+        if not otp:
+            logger.error("[F%d] OTP not received from email", self.worker_id)
+            await self._screenshot("otp_timeout")
+            return False
+
+        logger.info("[F%d] Got OTP: %s", self.worker_id, otp)
+
+        # Enter OTP in input field
+        otp_entered = await self.page.evaluate(f"""
+            (() => {{
+                // Find OTP input — usually near "Enter One-time Password" text
+                const inputs = document.querySelectorAll('input[type="text"], input[type="number"], input:not([type])');
+                for (const inp of inputs) {{
+                    const parent = inp.closest('.otp, [class*="otp"], [class*="OTP"]');
+                    const label = inp.closest('mat-form-field, .form-group');
+                    const nearby = (parent || label || inp.parentElement)?.textContent?.toLowerCase() || '';
+                    if (nearby.includes('otp') || nearby.includes('one-time') || nearby.includes('password')) {{
+                        const nv = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value');
+                        nv.set.call(inp, '{otp}');
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                        return true;
+                    }}
+                }}
+                // Fallback: any visible text input that's empty
+                for (const inp of inputs) {{
+                    if (!inp.value && inp.offsetParent !== null && !inp.disabled) {{
+                        const nv = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value');
+                        nv.set.call(inp, '{otp}');
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+        """)
+        if not otp_entered:
+            logger.error("[F%d] Cannot enter OTP into input", self.worker_id)
+            return False
+
+        await self._delay(0.5, 1)
+
+        # Click Verify button
+        verify_clicked = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t.includes('verify') && !b.disabled) {
+                        b.click(); return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+        if not verify_clicked:
+            logger.error("[F%d] Verify button not found", self.worker_id)
+            return False
+
+        logger.info("[F%d] OTP Verify clicked", self.worker_id)
+        await self._delay(3, 5)
+
+        # Check verification success
+        for _ in range(10):
+            verified = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('otp verification successful') ||
+                           text.includes('verified successfully') ||
+                           text.includes('verification successful');
+                })()
+            """)
+            if verified:
+                logger.info("[F%d] OTP verified successfully!", self.worker_id)
+                break
+            await asyncio.sleep(2)
+
+        await self._screenshot("otp_verified")
+
+        # Click Continue after OTP (orange button)
+        clicked = await self.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t === 'continue' && !b.disabled) {
+                        b.click(); return true;
+                    }
+                }
+                const orange = document.querySelector('button.btn-brand-orange:not([disabled])');
+                if (orange) { orange.click(); return true; }
+                return false;
+            })()
+        """)
+        if not clicked:
+            logger.warning("[F%d] Continue after OTP not found", self.worker_id)
+            return False
+
+        logger.info("[F%d] Continue after OTP → Step 3 (Book Appointment)", self.worker_id)
+        await self._delay(3, 5)
+        return True
+
+    async def _fighter_select_date_time(self) -> tuple[str, str]:
+        """Select first available date from calendar, then earliest time slot."""
+        # Wait for calendar to load
+        for _ in range(15):
+            has_calendar = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('book appointment') || text.includes('choose an appointment') ||
+                           text.includes('available') || text.includes('unavailable') ||
+                           !!document.querySelector('.fc-daygrid, .calendar, [class*="calendar"]');
+                })()
+            """)
+            if has_calendar:
+                break
+            await asyncio.sleep(2)
+
+        await self._screenshot("calendar_page")
+        await self._delay(1, 2)
+
+        # Click first available date (green border / not greyed out)
+        date_clicked = await self.page.evaluate("""
+            (() => {
+                // FullCalendar: look for clickable day cells
+                const dayCells = document.querySelectorAll(
+                    'a.fc-daygrid-day-number, td.fc-daygrid-day, .fc-day'
+                );
+                for (const cell of dayCells) {
+                    const td = cell.closest('td') || cell;
+                    const classes = td.className || '';
+                    // Skip disabled/past/other-month days
+                    if (classes.includes('fc-day-disabled') || classes.includes('fc-day-past') ||
+                        classes.includes('fc-day-other')) continue;
+                    // Check if clickable (available)
+                    const bg = window.getComputedStyle(td).backgroundColor;
+                    const border = window.getComputedStyle(td).borderColor;
+                    const link = td.querySelector('a');
+                    if (link) {
+                        link.click();
+                        return td.getAttribute('data-date') || link.textContent.trim();
+                    }
+                    td.click();
+                    return td.getAttribute('data-date') || td.textContent.trim();
+                }
+                // Fallback: click any day number link
+                const links = document.querySelectorAll('a.fc-daygrid-day-number');
+                for (const a of links) {
+                    const td = a.closest('td');
+                    if (td && !td.classList.contains('fc-day-disabled')) {
+                        a.click();
+                        return td.getAttribute('data-date') || a.textContent.trim();
+                    }
+                }
+                // Alternative calendar format: plain date buttons/links
+                const dateBtns = document.querySelectorAll(
+                    '[class*="available"], [class*="active-date"], button[class*="date"]'
+                );
+                for (const b of dateBtns) {
+                    if (!b.disabled) {
+                        b.click();
+                        return b.textContent.trim();
+                    }
+                }
+                return null;
+            })()
+        """)
+
+        if not date_clicked:
+            logger.error("[F%d] No available date found in calendar", self.worker_id)
+            await self._screenshot("no_dates")
+            return ("", "")
+
+        logger.info("[F%d] Date clicked: %s", self.worker_id, date_clicked)
+        await self._delay(2, 4)
+        await self._screenshot("after_date_select")
+
+        # Wait for time slots to appear
+        for _ in range(10):
+            has_times = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('select') && (text.includes('time') ||
+                           text.includes('08:') || text.includes('09:') || text.includes('10:'));
+                })()
+            """)
+            if has_times:
+                break
+            await asyncio.sleep(2)
+
+        # Select earliest time slot (click first "Select" button)
+        time_info = await self.page.evaluate("""
+            (() => {
+                // Time slots are rows with time text + "Select" button
+                const rows = document.querySelectorAll('tr, div[class*="slot"], div[class*="time"]');
+                for (const row of rows) {
+                    const selectBtn = row.querySelector('button');
+                    if (selectBtn && selectBtn.textContent.trim().toLowerCase() === 'select') {
+                        // Get the time from this row
+                        const timeText = row.textContent.replace('Select', '').trim();
+                        selectBtn.click();
+                        return timeText;
+                    }
+                }
+                // Fallback: find any "Select" button in the time section
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    if (b.textContent.trim().toLowerCase() === 'select' && !b.disabled) {
+                        const parent = b.closest('tr, div');
+                        const timeText = parent ? parent.textContent.replace('Select', '').trim() : '';
+                        b.click();
+                        return timeText || 'earliest';
+                    }
+                }
+                return null;
+            })()
+        """)
+
+        if not time_info:
+            logger.error("[F%d] No time slot found", self.worker_id)
+            await self._screenshot("no_times")
+            return ("", "")
+
+        logger.info("[F%d] Time selected: %s", self.worker_id, time_info)
+        await self._delay(2, 3)
+        await self._screenshot("after_time_select")
+
+        return (str(date_clicked), str(time_info))
+
+    async def _fighter_skip_services(self) -> bool:
+        """Step 4: Services page — just click Continue without adding anything."""
+        # Wait for services page
+        for _ in range(10):
+            on_services = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('services') && (text.includes('premium lounge') ||
+                           text.includes('courier') || text.includes('add') ||
+                           text.includes('unit cost'));
+                })()
+            """)
+            if on_services:
+                break
+            await asyncio.sleep(2)
+
+        await self._screenshot("services_page")
+        await self._delay(1, 2)
+
+        # Click Continue (don't add any services)
+        clicked = await self.page.evaluate("""
+            (() => {
+                // Orange Continue button at bottom
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t === 'continue' && !b.disabled &&
+                        (b.classList.contains('btn-brand-orange') ||
+                         b.classList.contains('mat-mdc-raised-button'))) {
+                        b.click(); return true;
+                    }
+                }
+                // Any Continue button
+                for (const b of btns) {
+                    if (b.textContent.trim().toLowerCase() === 'continue' && !b.disabled) {
+                        b.click(); return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+        if not clicked:
+            logger.warning("[F%d] Services Continue not found", self.worker_id)
+            return False
+
+        logger.info("[F%d] Services skipped → Step 5 (Review)", self.worker_id)
+        await self._delay(3, 5)
+        return True
+
+    async def _fighter_confirm(self) -> bool:
+        """Step 5: Review page — click Confirm to finalize booking."""
+        # Wait for Review page
+        for _ in range(10):
+            on_review = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('review') && (text.includes('applicant details') ||
+                           text.includes('appointment details') || text.includes('confirm'));
+                })()
+            """)
+            if on_review:
+                break
+            await asyncio.sleep(2)
+
+        await self._screenshot("review_page")
+        await self._delay(1, 2)
+
+        # Click Confirm button (id="trigger" or class="ot-submit-button" or orange button)
+        confirmed = await self.page.evaluate("""
+            (() => {
+                // Primary: button#trigger
+                const trigger = document.querySelector('button#trigger');
+                if (trigger && !trigger.disabled) { trigger.click(); return 'trigger'; }
+                // Secondary: ot-submit-button class
+                const otBtn = document.querySelector('button.ot-submit-button');
+                if (otBtn && !otBtn.disabled) { otBtn.click(); return 'ot-submit'; }
+                // Tertiary: any Confirm button
+                const btns = document.querySelectorAll('button');
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t === 'confirm' && !b.disabled) {
+                        b.click(); return 'text-match';
+                    }
+                }
+                // Orange button with confirm text
+                for (const b of btns) {
+                    if (b.textContent.trim().toLowerCase().includes('confirm') &&
+                        b.classList.contains('btn-brand-orange') && !b.disabled) {
+                        b.click(); return 'orange-confirm';
+                    }
+                }
+                return null;
+            })()
+        """)
+
+        if not confirmed:
+            logger.error("[F%d] Confirm button not found!", self.worker_id)
+            await self._screenshot("no_confirm_button")
+            return False
+
+        logger.info("[F%d] Confirm clicked (%s)! Waiting for success...", self.worker_id, confirmed)
+        await self._delay(5, 10)
+
+        # Verify booking success
+        for _ in range(15):
+            success = await self.page.evaluate("""
+                (() => {
+                    const text = (document.body.innerText || '').toLowerCase();
+                    return text.includes('thank you for booking') ||
+                           text.includes('booking confirmed') ||
+                           text.includes('appointment has been booked') ||
+                           text.includes('transaction summary');
+                })()
+            """)
+            if success:
+                logger.info("[F%d] BOOKING SUCCESS confirmed on page!", self.worker_id)
+                await self._screenshot("booking_confirmed", send_tg=True)
+                return True
+            await asyncio.sleep(2)
+
+        # Check for errors
+        error_text = await self.page.evaluate("""
+            (() => {
+                const text = (document.body.innerText || '').toLowerCase();
+                if (text.includes('error') || text.includes('failed') || text.includes('sorry'))
+                    return text.substring(0, 300);
+                return null;
+            })()
+        """)
+        if error_text:
+            logger.error("[F%d] Booking error: %s", self.worker_id, error_text)
+        await self._screenshot("confirm_unclear")
+        return False

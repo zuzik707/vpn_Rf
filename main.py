@@ -26,7 +26,11 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-from accounts_db import get_enabled_accounts, import_from_env, count_accounts, ban_account, toggle_account
+from accounts_db import (
+    get_enabled_accounts, import_from_env, count_accounts, ban_account,
+    toggle_account, get_fighter_accounts, get_applicants, mark_applicant_booked,
+    get_scout_accounts,
+)
 from budget_guard import BudgetGuard
 from config import Config
 from notifier import notify_error, notify_slots_found, notify_status
@@ -517,7 +521,9 @@ async def run_monitor():
                 await asyncio.to_thread(notify_status,
                     f"♻️ Auto-unban: {email_ub.split('@')[0]}\n30 мин прошло — включаю обратно для проверки")
 
-            db_accounts = get_enabled_accounts()
+            db_accounts = get_scout_accounts()
+            if not db_accounts:
+                db_accounts = get_enabled_accounts()
             available = [a for a in db_accounts if a["email"] not in banned_emails]
 
             if not available:
@@ -609,6 +615,9 @@ async def run_monitor():
                                     f"{tag}\n{info}", screenshot)
                                 hot_mode_shared["until"] = time.time() + Config.HOT_MODE_DURATION
                                 hot_mode_shared["active"] = True
+                                # ATTACK MODE: launch all fighters
+                                sub_used = Config.VFS_SUBCATEGORIES[_sub_idx] if _sub_idx < len(Config.VFS_SUBCATEGORIES) else ""
+                                asyncio.create_task(launch_fighters(sub_used, info))
                                 slot_found = True
                                 break
                             else:
@@ -640,6 +649,172 @@ async def run_monitor():
             pause = random.uniform(15, 40)
             logger.info("%s Пауза %.0fс", tag, pause)
             await asyncio.sleep(pause)
+
+    # ── Attack mode: launch all fighters when scouts find slots ──
+    attack_lock = asyncio.Lock()
+    attack_running = False
+
+    async def launch_fighters(subcategory: str, scout_info: str):
+        nonlocal attack_running
+        async with attack_lock:
+            if attack_running:
+                logger.info("Attack already running, skipping duplicate trigger")
+                return
+            attack_running = True
+
+        try:
+            fighters = get_fighter_accounts()
+            applicants = {a["id"]: a for a in get_applicants(unbooked_only=True)}
+
+            if not fighters:
+                logger.warning("No fighter accounts configured!")
+                await asyncio.to_thread(notify_error,
+                    "No fighter accounts! Add via /setfighter")
+                return
+
+            if not applicants:
+                logger.warning("No unbooked applicants!")
+                await asyncio.to_thread(notify_error,
+                    "All applicants already booked! Add via /person")
+                return
+
+            # Group fighters by applicant
+            fighter_groups: dict[int, list[dict]] = {}
+            for f in fighters:
+                aid = f.get("applicant_id", 0)
+                if aid and aid in applicants:
+                    fighter_groups.setdefault(aid, []).append(f)
+
+            if not fighter_groups:
+                logger.warning("No fighters linked to unbooked applicants")
+                await asyncio.to_thread(notify_error,
+                    "Fighters not linked to applicants! Use /setfighter")
+                return
+
+            n_fighters = sum(len(v) for v in fighter_groups.values())
+            n_applicants = len(fighter_groups)
+            logger.info("ATTACK MODE: %d fighters for %d applicants", n_fighters, n_applicants)
+            await asyncio.to_thread(notify_status,
+                f"ATTACK MODE!\n"
+                f"Slots: {scout_info[:200]}\n"
+                f"Launching {n_fighters} fighters for {n_applicants} applicants\n"
+                f"Subcategory: {subcategory}")
+
+            # Launch all fighters with stagger
+            fighter_tasks = []
+            fighter_id_base = 100  # worker IDs 100+ for fighters
+
+            for applicant_id, acct_list in fighter_groups.items():
+                applicant = applicants[applicant_id]
+                passport = applicant.get("passport_file", "")
+                name = applicant.get("name", f"Applicant#{applicant_id}")
+
+                if not passport or not os.path.exists(passport):
+                    logger.error("No passport file for %s: %s", name, passport)
+                    continue
+
+                for i, acct in enumerate(acct_list[:Config.MAX_FIGHTERS]):
+                    fid = fighter_id_base + len(fighter_tasks)
+                    stagger = random.uniform(
+                        Config.FIGHTER_STAGGER_MIN * i,
+                        Config.FIGHTER_STAGGER_MAX * i + Config.FIGHTER_STAGGER_MIN,
+                    )
+
+                    task = asyncio.create_task(
+                        _run_single_fighter(
+                            fid, acct, applicant, subcategory, stagger,
+                            solver, stats,
+                        )
+                    )
+                    fighter_tasks.append((task, acct, applicant))
+
+            if not fighter_tasks:
+                logger.error("No fighters could be launched (missing passports?)")
+                return
+
+            # Wait for all fighters to complete
+            results = await asyncio.gather(
+                *[t for t, _, _ in fighter_tasks],
+                return_exceptions=True,
+            )
+
+            # Report results
+            booked = []
+            failed = []
+            for (_, acct, applicant), result in zip(fighter_tasks, results):
+                if isinstance(result, Exception):
+                    failed.append(f"{acct['email']}: crash {result}")
+                elif result and result.get("success"):
+                    name = applicant.get("name", "?")
+                    date = result.get("booked_date", "?")
+                    time_s = result.get("booked_time", "?")
+                    booked.append(f"{name}: {date} {time_s}")
+                    mark_applicant_booked(applicant["id"], f"{date} {time_s}")
+                else:
+                    err = result.get("error", "unknown") if result else "no result"
+                    failed.append(f"{acct['email']}: {err}")
+
+            report = f"ATTACK RESULTS\n"
+            if booked:
+                report += f"BOOKED ({len(booked)}):\n" + "\n".join(f"  {b}" for b in booked) + "\n"
+            if failed:
+                report += f"Failed ({len(failed)}):\n" + "\n".join(f"  {f}" for f in failed[:10])
+
+            logger.info(report)
+            await asyncio.to_thread(notify_status, report)
+
+        except Exception as e:
+            logger.error("Attack mode error: %s", e, exc_info=True)
+            await asyncio.to_thread(notify_error, f"Attack mode crash: {e}")
+        finally:
+            attack_running = False
+
+    async def _run_single_fighter(fid: int, acct: dict, applicant: dict,
+                                   subcategory: str, stagger: float,
+                                   captcha_solver, fight_stats: SessionStats):
+        """Run a single fighter browser instance."""
+        email = acct["email"]
+        proxy_url = acct.get("proxy") or Config.PROXY_URL
+        passport = applicant.get("passport_file", "")
+        name = applicant.get("name", "?")
+        mail_pwd = acct.get("mail_password", "")
+        tag = f"[F{fid}:{email.split('@')[0]}→{name}]"
+
+        if stagger > 0:
+            logger.info("%s Stagger wait %.1fs", tag, stagger)
+            await asyncio.sleep(stagger)
+
+        checker = VFSBrowser(
+            captcha_solver=captcha_solver, email=email, password=acct["password"],
+            proxy_url=proxy_url, worker_id=fid,
+        )
+
+        try:
+            logger.info("%s Starting fighter", tag)
+            result = await checker.auto_book(
+                passport_path=passport,
+                applicant_name=name,
+                mail_password=mail_pwd,
+                subcategory=subcategory,
+            )
+            if result.get("success"):
+                logger.info("%s BOOKED! %s %s", tag,
+                           result.get("booked_date"), result.get("booked_time"))
+                await asyncio.to_thread(notify_slots_found,
+                    f"{tag} ЗАБРОНИРОВАНО!\n"
+                    f"Дата: {result.get('booked_date')}\n"
+                    f"Время: {result.get('booked_time')}\n"
+                    f"Человек: {name}",
+                    None)
+            else:
+                logger.warning("%s Failed at %s: %s", tag,
+                             result.get("step"), result.get("error"))
+            return result
+        except Exception as e:
+            logger.error("%s Fighter crash: %s", tag, e, exc_info=True)
+            return {"success": False, "step": "crash", "error": str(e)}
+        finally:
+            await checker.close_browser()
 
     tasks = []
     try:
