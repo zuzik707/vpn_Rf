@@ -241,7 +241,7 @@ class TelegramBot:
         elif cmd in ("/remove", "/del", "/delete"):
             self._cmd_remove(arg)
         elif cmd == "/deleteall":
-            self._cmd_deleteall()
+            self._cmd_deleteall(chat_id)
         elif cmd in ("/list", "/accounts"):
             self._cmd_list()
         elif cmd == "/enable":
@@ -314,6 +314,14 @@ class TelegramBot:
                 return
             del self._pending[chat_id]
             self._run_registration(email)
+
+        elif step == "confirm_deleteall":
+            if text.strip().upper() == "ДА":
+                del self._pending[chat_id]
+                self._do_deleteall()
+            else:
+                del self._pending[chat_id]
+                self.send("Отменено")
 
     def _save_account(self, email: str, password: str):
         proxy = _make_proxy_for_account(email)
@@ -493,11 +501,17 @@ class TelegramBot:
         if deleted:
             self._notify_accounts_changed()
 
-    def _cmd_deleteall(self):
+    def _cmd_deleteall(self, chat_id: str):
         accounts = get_all_accounts()
         if not accounts:
             self.send("Аккаунтов нет")
             return
+        self._pending[chat_id] = {"step": "confirm_deleteall", "count": len(accounts)}
+        self.send(f"Удалить ВСЕ {len(accounts)} аккаунтов?\n\n"
+                  f"Напиши <b>ДА</b> для подтверждения или /cancel для отмены")
+
+    def _do_deleteall(self):
+        accounts = get_all_accounts()
         count = 0
         for a in accounts:
             if remove_account(a["email"]):
