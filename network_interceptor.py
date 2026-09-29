@@ -122,11 +122,9 @@ class NetworkInterceptor:
             slot_data.source_url = resp["url"]
 
             if isinstance(body, dict):
-                is_avail = (
-                    body.get("IsSlotAvailable")
-                    or body.get("isSlotAvailable")
-                    or body.get("slotAvailable")
-                    or body.get("available")
+                is_avail = any(
+                    body.get(k) is True
+                    for k in ("IsSlotAvailable", "isSlotAvailable", "slotAvailable", "available")
                 )
                 if is_avail:
                     slot_data.available = True

@@ -713,6 +713,9 @@ class VFSBrowser:
             return False
 
     async def _solve_turnstile(self) -> bool:
+        if not self.captcha_solver:
+            logger.error("captcha_solver не настроен — не могу решить Turnstile")
+            return False
         # Check if Turnstile already solved itself (managed/invisible mode)
         token_exists = await self.page.evaluate("""
             (() => {
@@ -852,7 +855,7 @@ class VFSBrowser:
                     logger.info("Stale cookies deleted: %s", self._cookies_path)
             except OSError:
                 pass
-            self._session_ts = 0
+            self.last_login_time = 0
             return False
         if state == "cloudflare":
             if not await self._wait_cloudflare():

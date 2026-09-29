@@ -259,6 +259,8 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
             stats.logins_failed += 1
             logger.error("%s Логин не удался после 3 попыток", tag)
             await asyncio.to_thread(notify_error, f"{tag} Логин не удался после 3 попыток. Проверь proxy/credentials.")
+            await checker.close_browser()
+            return
         else:
             await asyncio.to_thread(notify_status, f"{tag} залогинился, начинаю проверку слотов")
             post_login_pause = random.uniform(30, 90)
@@ -508,7 +510,11 @@ async def run_monitor():
         other_event = relay_events[1 - wid]
 
         while running:
-            await my_event.wait()
+            try:
+                await asyncio.wait_for(my_event.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                if not running:
+                    break
             my_event.clear()
 
             # Auto-unban accounts after 30 min cooldown
@@ -617,7 +623,11 @@ async def run_monitor():
                                 hot_mode_shared["active"] = True
                                 # ATTACK MODE: launch all fighters
                                 sub_used = Config.VFS_SUBCATEGORIES[_sub_idx] if _sub_idx < len(Config.VFS_SUBCATEGORIES) else ""
-                                asyncio.create_task(launch_fighters(sub_used, info))
+                                attack_task = asyncio.create_task(launch_fighters(sub_used, info))
+                                attack_task.add_done_callback(
+                                    lambda t: logger.error("Attack task crashed: %s", t.exception())
+                                    if not t.cancelled() and t.exception() else None
+                                )
                                 slot_found = True
                                 break
                             else:
@@ -640,10 +650,13 @@ async def run_monitor():
                 logger.error("%s Ошибка: %s", tag, e, exc_info=True)
             finally:
                 await checker.close_browser()
+                if not signaled:
+                    other_event.set()
+                    signaled = True
 
-            # Signal other worker if not yet (error/ban path)
-            if not signaled:
-                other_event.set()
+            # Expire hot mode if needed
+            if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
+                hot_mode_shared["active"] = False
 
             # Short random pause before next turn
             pause = random.uniform(15, 40)
@@ -772,7 +785,8 @@ async def run_monitor():
             logger.error("Attack mode error: %s", e, exc_info=True)
             await asyncio.to_thread(notify_error, f"Attack mode crash: {e}")
         finally:
-            attack_running = False
+            async with attack_lock:
+                attack_running = False
 
     async def _run_single_fighter(fid: int, acct: dict, applicant: dict,
                                    subcategory: str, stagger: float,

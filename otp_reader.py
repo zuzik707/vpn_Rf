@@ -48,6 +48,7 @@ async def fetch_otp_mailto_plus(email: str, epin: str = "",
                         mail_id = str(mail.get("mail_id", ""))
                         if mail_id in seen_ids:
                             continue
+                        seen_ids.add(mail_id)
                         subject = (mail.get("subject") or "").lower()
                         text = mail.get("text") or mail.get("body") or ""
                         if "otp" in subject or "one-time" in subject or "verification" in subject or "vfs" in subject:
@@ -55,13 +56,11 @@ async def fetch_otp_mailto_plus(email: str, epin: str = "",
                             if otp:
                                 logger.info("OTP found: %s (from mail %s)", otp, mail_id)
                                 return otp
-                        # Also check mail body even if subject doesn't match
                         if "vfs" in text.lower() or "one-time password" in text.lower():
                             otp = _extract_otp(text)
                             if otp:
                                 logger.info("OTP found in body: %s", otp)
                                 return otp
-                        seen_ids.add(mail_id)
             except asyncio.TimeoutError:
                 logger.debug("mailto.plus poll timeout")
             except Exception as e:

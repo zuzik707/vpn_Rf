@@ -219,8 +219,8 @@ def ban_account(email: str, reason: str = "") -> bool:
         ban_time = time.strftime("%Y-%m-%d %H:%M", time.localtime())
         note = f"BANNED {ban_time}: {reason[:100]}"
         cur = conn.execute(
-            "UPDATE accounts SET enabled = 0, notes = ? WHERE email = ?",
-            (note, email.strip().lower()),
+            "UPDATE accounts SET enabled = 0, notes = CASE WHEN notes = '' THEN ? ELSE notes || '\n' || ? END WHERE email = ?",
+            (note, note, email.strip().lower()),
         )
         conn.commit()
         return cur.rowcount > 0

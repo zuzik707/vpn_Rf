@@ -29,6 +29,7 @@ import time
 import requests
 
 from config import Config
+from notifier import send_telegram_photo
 from accounts_db import (
     add_account, remove_account, toggle_account,
     get_all_accounts, count_accounts, get_banned_accounts,
@@ -658,7 +659,7 @@ class TelegramBot:
                 try:
                     loop = asyncio.new_event_loop()
                     result = loop.run_until_complete(
-                        VFSBot._verify_account_vfs(email, password, proxy))
+                        TelegramBot._verify_account_vfs(email, password, proxy))
                     loop.close()
                     if result == "active":
                         active.append(email)
