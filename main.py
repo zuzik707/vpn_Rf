@@ -497,6 +497,9 @@ async def run_monitor():
     relay_events[0].set()  # Worker 0 starts immediately
 
     async def relay_worker(wid: int):
+        # Use worker_id 10+wid to avoid port conflicts with registration (worker 99)
+        # and old parallel workers (0-N)
+        proxy_wid = 10 + wid
         consecutive_errors = 0
         my_event = relay_events[wid]
         other_event = relay_events[1 - wid]
@@ -527,9 +530,10 @@ async def run_monitor():
 
             checker = VFSBrowser(
                 captcha_solver=solver, email=email, password=acct["password"],
-                proxy_url=proxy_url, worker_id=wid,
+                proxy_url=proxy_url, worker_id=proxy_wid,
             )
 
+            signaled = False
             try:
                 stats.logins_total += 1
                 login_ok = await checker.login()
@@ -563,7 +567,6 @@ async def run_monitor():
                 total_checks = 2 * n_subs  # 2 rounds × 2 subcategories = 4
                 check_num = 0
                 slot_found = False
-                signaled = False
 
                 for round_num in range(2):
                     if slot_found:
