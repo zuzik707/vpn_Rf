@@ -616,6 +616,16 @@ class VFSBrowser:
                         }
                     }
                 }
+                // 8. Extract from page HTML — VFS embeds sitekey in rendered HTML
+                const html = document.documentElement.innerHTML;
+                const skMatch = html.match(/(?:data-sitekey|sitekey)[=:"'\s]+([0-9a-zA-Z_-]{20,65})/);
+                if (skMatch) return skMatch[1];
+                // 9. Check cf-chl-widget ID pattern for Turnstile render params
+                const widgetEl = document.querySelector('[id*="cf-chl-widget"]');
+                if (widgetEl) {
+                    const parent = widgetEl.closest('[data-sitekey]');
+                    if (parent) return parent.getAttribute('data-sitekey');
+                }
                 return null;
             })()
         """)
@@ -731,6 +741,12 @@ class VFSBrowser:
             return True
 
         sitekey = await self._extract_sitekey()
+        if not sitekey:
+            for _wait in range(6):
+                await asyncio.sleep(3)
+                sitekey = await self._extract_sitekey()
+                if sitekey:
+                    break
         if not sitekey:
             cf_debug = await self.page.evaluate("""
                 (() => {
