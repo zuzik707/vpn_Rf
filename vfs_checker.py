@@ -1445,7 +1445,6 @@ class VFSBrowser:
                 if api_result.dates:
                     info += f" Даты: {', '.join(api_result.dates[:5])}"
                 logger.info("СЛОТЫ (API): %s", info)
-                await self._advance_to_step2()
                 return True, info, screenshot
 
         text = await self._text()
@@ -1497,8 +1496,6 @@ class VFSBrowser:
                 })()
             """)
             info = date_info if date_info else "Слоты доступны — кнопка Continue активна!"
-            # Advance to step 2 (Your Details / passport page) and send screenshot
-            await self._advance_to_step2()
             return True, info, screenshot
 
         if continue_disabled is True:
