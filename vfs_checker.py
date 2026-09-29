@@ -1480,21 +1480,9 @@ class VFSBrowser:
                 break
         await self._screenshot("after_subcategory_select")
 
-        # Проверяем перехваченные API-ответы
-        if self.interceptor.has_data:
-            api_result = await self.interceptor.check_api_slots()
-            if api_result.available:
-                screenshot = await self._screenshot("slots_found", send_tg=True)
-                info = f"API: слоты найдены!"
-                if api_result.earliest_date:
-                    info += f" Ближайшая дата: {api_result.earliest_date}"
-                if api_result.dates:
-                    info += f" Даты: {', '.join(api_result.dates[:5])}"
-                logger.info("СЛОТЫ (API): %s", info)
-                return True, info, screenshot
-
         text = await self._text()
 
+        # Сначала проверяем DOM — "no appointment slots" всегда правда
         if NO_SLOTS_TEXT in text:
             logger.info("Нет слотов для '%s'", subcategory)
             return False, "Нет слотов", None
@@ -1539,6 +1527,12 @@ class VFSBrowser:
         """)
 
         if continue_disabled is False:
+            # Перепроверяем текст страницы — VFS может показать активную кнопку Continue
+            # даже когда слотов нет (баг VFS при смене подкатегории)
+            recheck_text = (await self._text()).lower()
+            if "no appointment slots" in recheck_text or "we are sorry" in recheck_text:
+                logger.warning("Continue активна, но текст 'no slots' — ЛОЖНОЕ СРАБАТЫВАНИЕ для '%s'", subcategory)
+                return False, "Continue активна но слотов нет (текст)", None
             screenshot = await self._screenshot("slots_found", send_tg=True)
             logger.info("СЛОТЫ НАЙДЕНЫ для '%s'!", subcategory)
             date_info = await self.page.evaluate("""
@@ -1564,6 +1558,23 @@ class VFSBrowser:
 
         if "no appointment" in text or "sorry" in text:
             return False, "Нет слотов (текст)", None
+
+        # API interceptor — дополнительный сигнал, но только если DOM не говорит "нет слотов"
+        if self.interceptor.has_data:
+            api_result = await self.interceptor.check_api_slots()
+            if api_result.available:
+                final_text = (await self._text()).lower()
+                if "no appointment slots" in final_text or "we are sorry" in final_text:
+                    logger.warning("API говорит слоты есть, но DOM 'no slots' — игнорируем API")
+                else:
+                    screenshot = await self._screenshot("slots_found", send_tg=True)
+                    info = f"API: слоты найдены!"
+                    if api_result.earliest_date:
+                        info += f" Ближайшая дата: {api_result.earliest_date}"
+                    if api_result.dates:
+                        info += f" Даты: {', '.join(api_result.dates[:5])}"
+                    logger.info("СЛОТЫ (API): %s", info)
+                    return True, info, screenshot
 
         screenshot = await self._screenshot("unclear")
         await dump_page(self.page, "unclear")

@@ -122,6 +122,12 @@ class NetworkInterceptor:
             slot_data.source_url = resp["url"]
 
             if isinstance(body, dict):
+                logger.info("API body keys: %s", list(body.keys())[:15])
+                for k in ("IsSlotAvailable", "isSlotAvailable", "slotAvailable", "available"):
+                    v = body.get(k)
+                    if v is not None:
+                        logger.info("  %s = %r (type=%s)", k, v, type(v).__name__)
+
                 is_avail = any(
                     body.get(k) is True
                     for k in ("IsSlotAvailable", "isSlotAvailable", "slotAvailable", "available")
@@ -134,7 +140,7 @@ class NetworkInterceptor:
                     or body.get("earliestDate")
                     or body.get("earliestSlotDate")
                 )
-                if earliest:
+                if earliest and str(earliest).strip() not in ("", "null", "None"):
                     slot_data.available = True
                     slot_data.earliest_date = str(earliest)
 
