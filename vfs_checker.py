@@ -506,6 +506,30 @@ class VFSBrowser:
                 await self._screenshot("cf_passed")
                 return True
             elapsed = time.time() - t0
+            # Check if invisible Turnstile auto-solved in background
+            token_auto = await self.page.evaluate("""
+                (() => {
+                    const el = document.querySelector('[name="cf-turnstile-response"]');
+                    return el && el.value && el.value.length > 20;
+                })()
+            """)
+            if token_auto:
+                logger.info("CF: Turnstile auto-solved (invisible mode, %.0fс)", elapsed)
+                await asyncio.sleep(1)
+                if await self._page_state() not in ("cloudflare", "captcha"):
+                    return True
+                # Token filled but page still shows captcha — try submitting
+                try:
+                    btn = await self.page.query_selector('button[type="submit"], input[type="submit"]')
+                    if btn:
+                        await btn.click()
+                        await asyncio.sleep(3)
+                        if await self._page_state() not in ("cloudflare", "captcha"):
+                            logger.info("CF: passed after submit with auto-token")
+                            return True
+                except Exception:
+                    pass
+
             # Wait for Turnstile widget to become visible (CF shows "please wait" first)
             if not widget_ready:
                 widget_ready = await self._is_turnstile_visible()
@@ -537,10 +561,14 @@ class VFSBrowser:
         return False
 
     async def _is_turnstile_visible(self) -> bool:
-        """Check if Turnstile widget has rendered (iframe OR container with visible size)."""
+        """Check if Turnstile widget has rendered (iframe OR container with visible size, OR token already filled)."""
         try:
             return await self.page.evaluate("""
                 (() => {
+                    // 0. Token already filled = invisible Turnstile solved itself
+                    const tokenEl = document.querySelector('[name="cf-turnstile-response"]');
+                    if (tokenEl && tokenEl.value && tokenEl.value.length > 20) return true;
+
                     // 1. Cloudflare iframe with non-zero size
                     for (const f of document.querySelectorAll('iframe')) {
                         if (f.src && (f.src.includes('challenges.cloudflare.com') || f.src.includes('turnstile'))) {
