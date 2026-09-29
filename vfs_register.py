@@ -139,34 +139,55 @@ class VFSRegistrar:
         try:
             await self.start_browser()
             self.page = await self.browser.get(REG_URL)
-            await self._delay(3, 5)
+            await self._delay(5, 8)
 
-            # Ждём загрузки страницы
-            for _ in range(10):
+            # Ждём загрузки страницы (может быть Cloudflare)
+            page_ready = False
+            for wait_i in range(20):
                 text = (await self.page.evaluate(
                     "document.body?.innerText || ''") or "").lower()
-                if "sign in" in text or "register" in text:
+                html = (await self.page.evaluate(
+                    "document.documentElement.outerHTML || ''") or "").lower()
+                if "sign in" in text or "register" in text or "password" in text:
+                    page_ready = True
                     break
-                await self._delay(1, 2)
+                # Cloudflare challenge — wait it out
+                if any(m in text for m in [
+                    "checking your browser", "just a moment",
+                    "verifying you are human",
+                ]) or "challenges.cloudflare.com" in html:
+                    logger.info("Reg: Cloudflare challenge, waiting... (%d/20)", wait_i + 1)
+                    await self._delay(3, 5)
+                    continue
+                await self._delay(2, 3)
+
+            if not page_ready:
+                await self._screenshot("reg_page_not_loaded")
+                return {"success": False, "error": "Страница VFS не загрузилась (возможно Cloudflare)"}
 
             await self._screenshot("reg_page_loaded")
 
             # Кликаем "I don't have an account"
-            clicked_reg = await self.page.evaluate("""
-                (() => {
-                    const links = document.querySelectorAll('a, button, span');
-                    for (const el of links) {
-                        const t = el.textContent.toLowerCase().trim();
-                        if (t.includes("don't have an account") || t.includes('do not have an account') ||
-                            t.includes('register') || t.includes('create account') ||
-                            t.includes('i don\\'t have an account')) {
-                            el.click();
-                            return true;
+            clicked_reg = False
+            for click_attempt in range(3):
+                clicked_reg = await self.page.evaluate("""
+                    (() => {
+                        const links = document.querySelectorAll('a, button, span');
+                        for (const el of links) {
+                            const t = el.textContent.toLowerCase().trim();
+                            if (t.includes("don't have an account") || t.includes('do not have an account') ||
+                                t.includes('register') || t.includes('create account') ||
+                                t.includes('i don\\'t have an account') || t.includes('sign up')) {
+                                el.click();
+                                return true;
+                            }
                         }
-                    }
-                    return false;
-                })()
-            """)
+                        return false;
+                    })()
+                """)
+                if clicked_reg:
+                    break
+                await self._delay(2, 3)
 
             if not clicked_reg:
                 await self._screenshot("reg_no_register_link")
