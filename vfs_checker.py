@@ -117,9 +117,15 @@ class VFSBrowser:
         session_id = hashlib.md5(self.email.encode()).hexdigest()[:12]
         at_idx = base.find('@')
         if at_idx == -1:
+            logger.warning("Proxy URL has no @ — cannot add session: %s", self.proxy_url[:60])
             return
         colon_idx = base.rfind(':', 0, at_idx)
+        if colon_idx == -1:
+            logger.warning("Proxy URL has no user:pass — cannot add session")
+            return
         self.proxy_url = base[:colon_idx] + f"-session-{session_id}" + base[colon_idx:]
+        safe = self.proxy_url.split('@')[-1] if '@' in self.proxy_url else self.proxy_url
+        logger.info("Sticky session: %s → session-%s (proxy: %s)", self.email.split('@')[0], session_id, safe)
 
     def set_credentials(self, email: str, password: str) -> None:
         self.email = email
