@@ -104,21 +104,34 @@ class TempMailClient:
         if not created:
             raise RuntimeError(f"Не удалось создать аккаунт за 5 попыток (последний: {self.address})")
 
-        # Получаем токен (retry если 401 — иногда задержка между созданием и авторизацией)
+        # Получаем токен (retry на 401, таймаут, сетевые ошибки)
         token_resp = None
-        for _ in range(3):
-            token_resp = self._session.post(
-                f"{BASE_URL}/token",
-                json={"address": self.address, "password": self.password},
-                timeout=10,
-            )
+        for t_attempt in range(5):
+            try:
+                token_resp = self._session.post(
+                    f"{BASE_URL}/token",
+                    json={"address": self.address, "password": self.password},
+                    timeout=15,
+                )
+            except (requests.ConnectionError, requests.Timeout, requests.ReadTimeout) as e:
+                wait = (t_attempt + 1) * 3
+                logger.warning("mail.tm token network error: %s — retry in %ds (%d/5)",
+                               e, wait, t_attempt + 1)
+                time.sleep(wait)
+                continue
             if token_resp.status_code == 200:
                 break
             if token_resp.status_code == 401:
-                logger.debug("Token 401 — retrying in 2s...")
-                time.sleep(2)
+                logger.debug("Token 401 — retrying in 3s... (%d/5)", t_attempt + 1)
+                time.sleep(3)
                 continue
-            token_resp.raise_for_status()
+            if token_resp.status_code == 429:
+                wait = (t_attempt + 1) * 10
+                logger.warning("mail.tm token 429 — waiting %ds (%d/5)", wait, t_attempt + 1)
+                time.sleep(wait)
+                continue
+            logger.warning("mail.tm token unexpected %d", token_resp.status_code)
+            time.sleep(3)
 
         if not token_resp or token_resp.status_code != 200:
             raise RuntimeError(
