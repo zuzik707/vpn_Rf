@@ -1098,7 +1098,7 @@ class VFSBrowser:
         if not warmed:
             logger.warning("Warming failed, прямой заход")
             await self.page.get(Config.VFS_URL)
-        await self._delay(3, 5)
+        await self._delay(5, 10)
         await self._screenshot("after_warming")
 
         # Check for proxy/network failure after warming
@@ -1267,7 +1267,7 @@ class VFSBrowser:
                     if not clicked:
                         await pwd_el.send_keys("\r")
 
-                await self._delay(4, 8)
+                await self._delay(6, 12)
                 await self._screenshot("after_signin_click")
                 state = await self._page_state()
 

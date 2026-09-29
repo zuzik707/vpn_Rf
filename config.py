@@ -63,15 +63,15 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # Адаптивные интервалы (секунды)
-    # День (10:00-22:00 Ташкент)
-    CHECK_INTERVAL_DAY_MIN = int(os.getenv("CHECK_INTERVAL_DAY_MIN", "60"))
-    CHECK_INTERVAL_DAY_MAX = int(os.getenv("CHECK_INTERVAL_DAY_MAX", "120"))
+    # День (10:00-22:00 Ташкент) — 3-5 мин между проверками
+    CHECK_INTERVAL_DAY_MIN = int(os.getenv("CHECK_INTERVAL_DAY_MIN", "180"))
+    CHECK_INTERVAL_DAY_MAX = int(os.getenv("CHECK_INTERVAL_DAY_MAX", "300"))
     # Ночь — экономим captcha budget и трафик
-    CHECK_INTERVAL_NIGHT_MIN = int(os.getenv("CHECK_INTERVAL_NIGHT_MIN", "300"))
-    CHECK_INTERVAL_NIGHT_MAX = int(os.getenv("CHECK_INTERVAL_NIGHT_MAX", "600"))
+    CHECK_INTERVAL_NIGHT_MIN = int(os.getenv("CHECK_INTERVAL_NIGHT_MIN", "600"))
+    CHECK_INTERVAL_NIGHT_MAX = int(os.getenv("CHECK_INTERVAL_NIGHT_MAX", "900"))
     # После обнаружения слотов — мониторим часто 15 мин
-    CHECK_INTERVAL_HOT_MIN = int(os.getenv("CHECK_INTERVAL_HOT_MIN", "10"))
-    CHECK_INTERVAL_HOT_MAX = int(os.getenv("CHECK_INTERVAL_HOT_MAX", "20"))
+    CHECK_INTERVAL_HOT_MIN = int(os.getenv("CHECK_INTERVAL_HOT_MIN", "30"))
+    CHECK_INTERVAL_HOT_MAX = int(os.getenv("CHECK_INTERVAL_HOT_MAX", "60"))
     HOT_MODE_DURATION = int(os.getenv("HOT_MODE_DURATION", "900"))
 
     # Тихие часы — полная пауза (Ташкент UTC+5)

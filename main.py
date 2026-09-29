@@ -214,10 +214,10 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
         logger.info("%s Stagger start: %.0fс", tag, stagger)
         await asyncio.sleep(stagger)
 
-    # Cooldown for freshly registered accounts — wait 3-5 min before first login
+    # Cooldown for freshly added accounts — wait 10-15 min before first login
     added_at = acct.get("added_at", 0)
-    if added_at and (time.time() - added_at) < 300:
-        cooldown = 300 - (time.time() - added_at) + random.uniform(30, 90)
+    if added_at and (time.time() - added_at) < 900:
+        cooldown = 900 - (time.time() - added_at) + random.uniform(60, 300)
         logger.info("%s Свежий аккаунт — пауза %.0fс перед первым логином", tag, cooldown)
         await asyncio.sleep(cooldown)
 
@@ -251,6 +251,11 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
             stats.logins_failed += 1
             logger.error("%s Логин не удался после 3 попыток", tag)
             await asyncio.to_thread(notify_error, f"{tag} Логин не удался после 3 попыток. Проверь proxy/credentials.")
+        else:
+            # Pause after login before first check — human doesn't immediately start clicking
+            post_login_pause = random.uniform(30, 90)
+            logger.info("%s Пауза %.0fс после логина", tag, post_login_pause)
+            await asyncio.sleep(post_login_pause)
 
         while running:
             if is_quiet_hours():
@@ -332,7 +337,14 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
                 hot_mode_until_shared.get("active", False),
                 cf_backoff=checker.should_backoff,
             )
-            logger.info("%s Сон %.0f сек", tag, sleep_time)
+            # Soft start: first 5 checks use 2-3x longer intervals
+            if checks_since_login <= 5:
+                multiplier = 3.0 - (checks_since_login * 0.4)  # 3.0, 2.6, 2.2, 1.8, 1.4, 1.0
+                sleep_time *= max(multiplier, 1.0)
+                logger.info("%s Мягкий старт (проверка %d/5): пауза %.0f сек",
+                           tag, checks_since_login, sleep_time)
+            else:
+                logger.info("%s Сон %.0f сек", tag, sleep_time)
             await asyncio.sleep(sleep_time)
 
     except asyncio.CancelledError:
