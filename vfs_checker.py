@@ -889,13 +889,8 @@ class VFSBrowser:
             await self._screenshot("blocked", send_tg=True)
             await dump_page(self.page, "blocked")
             self.cf_fail_count += 3
-            # Detect VFS account ban
-            if any(m in text for m in [
-                "access restricted", "restricted for user id",
-                "permission issues", "temporarily restricted",
-            ]):
-                self.banned = True
-                self.ban_reason = text[:150].strip()
+            self.banned = True
+            self.ban_reason = text[:150].strip() or "State: blocked"
             return False
         if state == "session_expired":
             logger.warning("Session expired — clearing cookies and restarting")
@@ -1207,6 +1202,7 @@ class VFSBrowser:
                 logger.info("DEBUG unknown — text: %s", text[:300])
 
             if state == "blocked":
+                await self._handle_obstacle()
                 return False
 
             if state == "session_expired":
