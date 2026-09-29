@@ -128,10 +128,7 @@ def is_daytime() -> bool:
 
 def validate_config() -> list[str]:
     missing = []
-    if not Config.VFS_ACCOUNTS:
-        for var in ("VFS_EMAIL", "VFS_PASSWORD"):
-            if not getattr(Config, var, ""):
-                missing.append(var)
+    # VFS_EMAIL/VFS_PASSWORD no longer required — accounts come from DB
     for var in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
         if not getattr(Config, var, ""):
             missing.append(var)
