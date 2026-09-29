@@ -1445,6 +1445,7 @@ class VFSBrowser:
                 if api_result.dates:
                     info += f" Даты: {', '.join(api_result.dates[:5])}"
                 logger.info("СЛОТЫ (API): %s", info)
+                await self._advance_to_step2()
                 return True, info, screenshot
 
         text = await self._text()
@@ -1496,6 +1497,8 @@ class VFSBrowser:
                 })()
             """)
             info = date_info if date_info else "Слоты доступны — кнопка Continue активна!"
+            # Advance to step 2 (Your Details / passport page) and send screenshot
+            await self._advance_to_step2()
             return True, info, screenshot
 
         if continue_disabled is True:
@@ -1508,6 +1511,64 @@ class VFSBrowser:
         screenshot = await self._screenshot("unclear")
         await dump_page(self.page, "unclear")
         return False, f"Неясный результат: {text[:200]}", screenshot
+
+    async def _advance_to_step2(self) -> None:
+        """After slots found: click Continue, wait for 'Please wait N seconds' countdown,
+        then screenshot the Your Details (passport) page and send to Telegram."""
+        try:
+            logger.info("Слоты найдены — нажимаю Continue для перехода на страницу паспортов...")
+
+            # Click the Continue button
+            clicked = await self.page.evaluate("""
+                (() => {
+                    const btns = document.querySelectorAll('button');
+                    for (const b of btns) {
+                        if (b.textContent.toLowerCase().includes('continue') && !b.disabled &&
+                            !b.classList.contains('mat-mdc-button-disabled')) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+            """)
+            if not clicked:
+                logger.warning("Continue button not found or disabled")
+                return
+
+            # Wait for "Please wait N seconds" countdown (up to 60s)
+            logger.info("Жду окончания таймера 'Please wait...'")
+            for _ in range(40):
+                await asyncio.sleep(2)
+                wait_text = await self.page.evaluate("""
+                    (() => {
+                        const text = document.body.innerText || '';
+                        const m = text.match(/please wait (\\d+) second/i);
+                        return m ? parseInt(m[1]) : 0;
+                    })()
+                """)
+                if wait_text and wait_text > 0:
+                    logger.info("Таймер: %d секунд осталось...", wait_text)
+                    continue
+
+                # Check if we're on step 2 (Your Details)
+                on_step2 = await self.page.evaluate("""
+                    (() => {
+                        const text = (document.body.innerText || '').toLowerCase();
+                        return text.includes('your details') || text.includes('passport') ||
+                               text.includes('first name') || text.includes('applicant') ||
+                               text.includes('date of birth') || text.includes('nationality');
+                    })()
+                """)
+                if on_step2:
+                    break
+
+            await self._delay(1.5, 3.0)
+            screenshot_path = await self._screenshot("step2_your_details", send_tg=True)
+            logger.info("Скриншот страницы паспортов отправлен в Telegram")
+
+        except Exception as e:
+            logger.error("Ошибка при переходе на step 2: %s", e)
 
     async def _reselect_subcategory(self, subcategory: str) -> bool:
         """Перевыбрать sub-category dropdown чтобы триггерить новую проверку слотов."""
