@@ -240,6 +240,8 @@ class TelegramBot:
             self._cmd_add_start(chat_id, arg)
         elif cmd in ("/remove", "/del", "/delete"):
             self._cmd_remove(arg)
+        elif cmd == "/deleteall":
+            self._cmd_deleteall()
         elif cmd in ("/list", "/accounts"):
             self._cmd_list()
         elif cmd == "/enable":
@@ -454,16 +456,55 @@ class TelegramBot:
 
     def _cmd_remove(self, arg: str):
         if not arg:
-            self.send("Формат: /remove email")
+            self.send("Формат:\n"
+                      "/delete email — удалить один\n"
+                      "/delete email1 email2 — несколько\n"
+                      "/delete 1 3 5 — по номерам из /list\n"
+                      "/deleteall — удалить ВСЕ")
             return
 
-        email = arg.strip()
-        if remove_account(email):
-            total = count_accounts()
-            self.send(f"Аккаунт <b>{email}</b> удалён\nВсего активных: {total}")
+        # Support multiple: /delete email1 email2 email3
+        # Support by number: /delete 1 3 5
+        parts = arg.strip().split()
+        accounts = get_all_accounts()
+
+        to_delete = []
+        for p in parts:
+            if p.isdigit():
+                idx = int(p) - 1
+                if 0 <= idx < len(accounts):
+                    to_delete.append(accounts[idx]["email"])
+                else:
+                    self.send(f"Номер {p} не существует (всего {len(accounts)})")
+            else:
+                to_delete.append(p.lower().strip())
+
+        if not to_delete:
+            self.send("Нечего удалять")
+            return
+
+        deleted = 0
+        for email in to_delete:
+            if remove_account(email):
+                deleted += 1
+
+        total = count_accounts()
+        self.send(f"Удалено: {deleted}/{len(to_delete)}\nВсего активных: {total}")
+        if deleted:
             self._notify_accounts_changed()
-        else:
-            self.send(f"Аккаунт {email} не найден")
+
+    def _cmd_deleteall(self):
+        accounts = get_all_accounts()
+        if not accounts:
+            self.send("Аккаунтов нет")
+            return
+        count = 0
+        for a in accounts:
+            if remove_account(a["email"]):
+                count += 1
+        self.send(f"Удалено ВСЕ аккаунты: {count}")
+        if count:
+            self._notify_accounts_changed()
 
     def _cmd_list(self):
         accounts = get_all_accounts()
