@@ -27,8 +27,8 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from accounts_db import (
-    get_enabled_accounts, import_from_env, count_accounts, ban_account,
-    toggle_account, get_fighter_accounts, get_applicants, mark_applicant_booked,
+    get_enabled_accounts, import_from_env, count_accounts, remove_account,
+    add_account, get_fighter_accounts, get_applicants, mark_applicant_booked,
     get_scout_accounts,
 )
 from budget_guard import BudgetGuard
@@ -245,13 +245,12 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
                 await asyncio.sleep(random.uniform(10, 20))
 
         if checker.banned:
-            ban_account(email, checker.ban_reason)
-            logger.error("%s ЗАБАНЕН VFS: %s", tag, checker.ban_reason[:100])
+            remove_account(email)
+            logger.error("%s ЗАБАНЕН VFS — УДАЛЁН из БД: %s", tag, checker.ban_reason[:100])
             await asyncio.to_thread(notify_error,
                 f"🚫 {tag} ЗАБАНЕН VFS!\n"
                 f"Причина: {checker.ban_reason[:100]}\n"
-                f"Аккаунт отключён. Бан обычно 12-24ч.\n"
-                f"Создай новый: /reg")
+                f"Аккаунт УДАЛЁН из БД. Replenisher создаст замену.")
             await checker.close_browser()
             return
 
@@ -303,13 +302,12 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
                 found, info, screenshot = await checker.check_slots()
 
                 if checker.banned:
-                    ban_account(email, checker.ban_reason)
-                    logger.error("%s ЗАБАНЕН VFS: %s", tag, checker.ban_reason[:100])
+                    remove_account(email)
+                    logger.error("%s ЗАБАНЕН VFS — УДАЛЁН из БД: %s", tag, checker.ban_reason[:100])
                     await asyncio.to_thread(notify_error,
                         f"🚫 {tag} ЗАБАНЕН VFS!\n"
                         f"Причина: {checker.ban_reason[:100]}\n"
-                        f"Аккаунт отключён. Бан обычно 12-24ч.\n"
-                        f"Создай новый: /reg")
+                        f"Аккаунт УДАЛЁН из БД. Replenisher создаст замену.")
                     await checker.close_browser()
                     return
 
@@ -519,16 +517,13 @@ async def run_monitor():
                 continue
             my_event.clear()
 
-            # Auto-unban accounts after 30 min cooldown
+            # Clean up stale entries from banned_emails (login-fail cooldowns)
             now = time.time()
-            unbanned = [e for e, t in banned_emails.items() if now - t >= BAN_COOLDOWN]
-            for email_ub in unbanned:
+            expired = [e for e, t in banned_emails.items() if now - t >= BAN_COOLDOWN]
+            for email_ub in expired:
                 del banned_emails[email_ub]
                 login_fails.pop(email_ub, None)
-                toggle_account(email_ub, True)
-                logger.info("Auto-unban: %s (30 мин прошло, включаю обратно)", email_ub)
-                await asyncio.to_thread(notify_status,
-                    f"♻️ Auto-unban: {email_ub.split('@')[0]}\n30 мин прошло — включаю обратно для проверки")
+                logger.info("Cooldown expired: %s (убран из banned_emails)", email_ub)
 
             db_accounts = get_scout_accounts()
             if not db_accounts:
@@ -563,11 +558,11 @@ async def run_monitor():
                 login_ok = await checker.login()
 
                 if checker.banned:
-                    ban_account(email, checker.ban_reason)
+                    remove_account(email)
                     banned_emails[email] = time.time()
-                    logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
+                    logger.error("%s ЗАБАНЕН — УДАЛЁН из БД: %s", tag, checker.ban_reason[:100])
                     await asyncio.to_thread(notify_error,
-                        f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nАвто-включу через 30 мин.")
+                        f"🚫 {tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nУдалён из БД. Replenisher создаст замену.")
                     await checker.close_browser()
                     other_event.set()
                     continue
@@ -615,11 +610,11 @@ async def run_monitor():
                             found, info, screenshot = await checker.check_slots()
 
                             if checker.banned:
-                                ban_account(email, checker.ban_reason)
+                                remove_account(email)
                                 banned_emails[email] = time.time()
-                                logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
+                                logger.error("%s ЗАБАНЕН — УДАЛЁН из БД: %s", tag, checker.ban_reason[:100])
                                 await asyncio.to_thread(notify_error,
-                                    f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nАвто-включу через 30 мин.")
+                                    f"🚫 {tag} ЗАБАНЁН VFS!\n{checker.ban_reason[:100]}\nУдалён из БД. Replenisher создаст замену.")
                                 slot_found = True
                                 break
 
@@ -852,9 +847,60 @@ async def run_monitor():
         finally:
             await checker.close_browser()
 
+    TARGET_POOL_SIZE = 30
+
+    async def account_replenisher():
+        """Background task: keeps scout account pool at TARGET_POOL_SIZE."""
+        from vfs_register import register_account
+        while running:
+            await asyncio.sleep(120)
+            try:
+                current = count_accounts(enabled_only=True)
+                if current >= TARGET_POOL_SIZE:
+                    continue
+                need = TARGET_POOL_SIZE - current
+                logger.info("Replenisher: %d/%d аккаунтов, создаю %d новых",
+                            current, TARGET_POOL_SIZE, need)
+                await asyncio.to_thread(notify_status,
+                    f"♻️ Replenisher: {current}/{TARGET_POOL_SIZE} аккаунтов. Создаю {need} новых...")
+
+                for i in range(need):
+                    if not running:
+                        break
+                    try:
+                        result = await register_account(
+                            proxy_url=Config.PROXY_URL,
+                            auto_activate=True,
+                        )
+                        if result.get("success"):
+                            new_email = result["email"]
+                            password = result["password"]
+                            mail_pwd = result.get("mail_password", "")
+                            add_account(new_email, password, Config.PROXY_URL,
+                                        notes="auto-replenished", mail_password=mail_pwd)
+                            activated = result.get("activated", False)
+                            status = "активирован" if activated else "нужна активация"
+                            logger.info("Replenisher: создан %s (%s)", new_email, status)
+                            await asyncio.to_thread(notify_status,
+                                f"✅ Replenisher: {new_email}\nСтатус: {status}\n"
+                                f"Пул: {count_accounts(enabled_only=True)}/{TARGET_POOL_SIZE}")
+                        else:
+                            err = result.get("error", "?")[:150]
+                            logger.warning("Replenisher: регистрация не удалась: %s", err)
+                            await asyncio.to_thread(notify_error,
+                                f"Replenisher: не удалось создать аккаунт\n{err}")
+                        await asyncio.sleep(random.uniform(60, 120))
+                    except Exception as e:
+                        logger.error("Replenisher reg error: %s", e, exc_info=True)
+                        await asyncio.sleep(120)
+            except Exception as e:
+                logger.error("Replenisher loop error: %s", e, exc_info=True)
+                await asyncio.sleep(300)
+
     tasks = []
     try:
         tasks.append(asyncio.create_task(heartbeat_loop()))
+        tasks.append(asyncio.create_task(account_replenisher()))
         r0 = asyncio.create_task(relay_worker(0))
         r1 = asyncio.create_task(relay_worker(1))
         tasks.extend([r0, r1])
