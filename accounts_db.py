@@ -26,20 +26,29 @@ def _conn() -> sqlite3.Connection:
             added_at    REAL DEFAULT 0,
             last_used   REAL DEFAULT 0,
             fail_count  INTEGER DEFAULT 0,
-            notes       TEXT DEFAULT ''
+            notes       TEXT DEFAULT '',
+            mail_password TEXT DEFAULT ''
         )
     """)
+    # Migration: add mail_password if table exists without it
+    try:
+        conn.execute("ALTER TABLE accounts ADD COLUMN mail_password TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     return conn
 
 
-def add_account(email: str, password: str, proxy: str = "", notes: str = "") -> bool:
+def add_account(email: str, password: str, proxy: str = "", notes: str = "",
+                mail_password: str = "") -> bool:
     conn = _conn()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO accounts (email, password, proxy, enabled, added_at, notes) "
-            "VALUES (?, ?, ?, 1, ?, ?)",
-            (email.strip().lower(), password.strip(), proxy.strip(), time.time(), notes),
+            "INSERT OR REPLACE INTO accounts "
+            "(email, password, proxy, enabled, added_at, notes, mail_password) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?)",
+            (email.strip().lower(), password.strip(), proxy.strip(),
+             time.time(), notes, mail_password),
         )
         conn.commit()
         logger.info("Account added: %s", email)
@@ -78,7 +87,7 @@ def get_enabled_accounts() -> list[dict]:
     conn = _conn()
     try:
         rows = conn.execute(
-            "SELECT email, password, proxy, fail_count, last_used, added_at "
+            "SELECT email, password, proxy, fail_count, last_used, added_at, mail_password "
             "FROM accounts WHERE enabled = 1 ORDER BY last_used ASC"
         ).fetchall()
         return [dict(r) for r in rows]

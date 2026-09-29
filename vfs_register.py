@@ -593,10 +593,12 @@ async def register_account(email: str = "", proxy_url: str = "",
     mail_client = None
     created_email = email
 
+    mail_password = ""
     if not email:
         try:
             mail_client = TempMailClient()
             created_email = mail_client.create_account()
+            mail_password = mail_client.password
             if progress_cb:
                 progress_cb(f"Email создан: <code>{created_email}</code>")
         except Exception as e:
@@ -664,6 +666,7 @@ async def register_account(email: str = "", proxy_url: str = "",
             act_result = {"success": True}
 
     result["email"] = created_email
+    result["mail_password"] = mail_password
     result["activated"] = act_result.get("success", False)
     if act_result.get("screenshot"):
         result["activation_screenshot"] = act_result["screenshot"]

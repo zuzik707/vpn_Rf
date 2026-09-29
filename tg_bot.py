@@ -63,6 +63,96 @@ def _make_proxy_for_account(email: str) -> str:
     return clean[:colon_idx] + f"-session-{session_id}" + clean[colon_idx:]
 
 
+async def _reactivate_account(email: str, vfs_password: str,
+                               mail_password: str, proxy: str,
+                               progress_cb=None) -> str:
+    """Try to reactivate: check VFS login, if inactive → go to mail.tm → activate."""
+    from vfs_checker import VFSBrowser
+    from vfs_register import VFSRegistrar
+
+    # First check if already active via VFS login
+    checker = VFSBrowser(email, vfs_password, proxy)
+    try:
+        await checker.start_browser()
+        await checker.warm_session()
+        login_ok = await checker.login()
+        if login_ok:
+            return "already_active"
+        if checker.banned:
+            return "banned"
+        # Check page for inactive message
+        text = ""
+        if checker.page:
+            text = (await checker.page.evaluate(
+                "document.body?.innerText || ''") or "").lower()
+        if "currently inactive" not in text:
+            return f"login failed (not inactive): {text[:80]}"
+    except Exception as e:
+        return f"login check error: {e}"
+    finally:
+        await checker.close_browser()
+
+    # Account is inactive — go to mail.tm to get activation link
+    if progress_cb:
+        progress_cb(f"Аккаунт неактивен. Захожу в mail.tm...")
+
+    from temp_mail import TempMailClient
+    mail_client = TempMailClient()
+    mail_client.address = email
+    mail_client.password = mail_password
+
+    # Login to mail.tm
+    try:
+        import requests as req
+        token_resp = mail_client._session.post(
+            f"https://api.mail.tm/token",
+            json={"address": email, "password": mail_password},
+            timeout=15,
+        )
+        if token_resp.status_code != 200:
+            return f"mail.tm login failed ({token_resp.status_code})"
+        mail_client.token = token_resp.json()["token"]
+        mail_client._session.headers["Authorization"] = f"Bearer {mail_client.token}"
+    except Exception as e:
+        return f"mail.tm login error: {e}"
+
+    # Look for activation email
+    message = mail_client.wait_for_email(
+        from_contains="vfsglobal", timeout_sec=10, poll_sec=2)
+    if not message:
+        # No email in inbox — try resend via VFS login
+        if progress_cb:
+            progress_cb("Письмо не найдено. Запрашиваю повторную отправку...")
+        from vfs_register import _try_resend_activation
+        resend_ok = await _try_resend_activation(
+            email, proxy, mail_client, progress_cb, password=vfs_password)
+        if resend_ok:
+            return "activated"
+        return "no activation email + resend failed"
+
+    activation_link = mail_client.extract_activation_link(message)
+    if not activation_link:
+        return "email found but no activation link"
+
+    if progress_cb:
+        progress_cb("Ссылка найдена! Активирую...")
+
+    activator = VFSRegistrar(proxy_url=proxy)
+    act_result = await activator.activate_account(activation_link)
+    if act_result.get("success"):
+        return "activated"
+
+    # Try resend as fallback
+    if progress_cb:
+        progress_cb("Прямая активация не сработала. Пробую resend...")
+    from vfs_register import _try_resend_activation
+    resend_ok = await _try_resend_activation(
+        email, proxy, mail_client, progress_cb, password=vfs_password)
+    if resend_ok:
+        return "activated"
+    return f"activation failed: {act_result.get('page_text', '?')[:80]}"
+
+
 class TelegramBot:
     def __init__(self, token: str, chat_id: str, status_cb=None):
         self.token = token
@@ -162,6 +252,8 @@ class TelegramBot:
             self._cmd_bans()
         elif cmd == "/verify":
             self._cmd_verify()
+        elif cmd == "/reactivate":
+            self._cmd_reactivate()
         elif cmd == "/cleanbans":
             self._cmd_cleanbans()
         elif cmd in ("/help", "/start"):
@@ -290,8 +382,10 @@ class TelegramBot:
                 final_email = result.get("email", email)
                 password = result["password"]
                 final_proxy = _make_proxy_for_account(final_email)
+                mail_pwd = result.get("mail_password", "")
 
-                if add_account(final_email, password, final_proxy):
+                if add_account(final_email, password, final_proxy,
+                               mail_password=mail_pwd):
                     self._notify_accounts_changed()
 
                 activated = result.get("activated", False)
@@ -487,6 +581,62 @@ class TelegramBot:
         t = threading.Thread(target=do_verify, daemon=True, name="verify")
         t.start()
 
+    def _cmd_reactivate(self):
+        """Re-activate accounts by going back to mail.tm inbox."""
+        from accounts_db import get_enabled_accounts
+        accounts = get_enabled_accounts()
+        with_mail = [a for a in accounts if a.get("mail_password")]
+        if not with_mail:
+            self.send("Нет аккаунтов с сохранённым mail.tm паролем.\n"
+                      "Новые аккаунты через /reg будут сохранять пароль автоматически.")
+            return
+
+        self.send(f"Проверяю и реактивирую {len(with_mail)} аккаунтов...\n"
+                  f"Захожу в mail.tm → ищу письмо → активирую")
+
+        bot = self
+        def do_reactivate():
+            ok = 0
+            fail = 0
+            already = 0
+            for i, acct in enumerate(with_mail):
+                email = acct["email"]
+                vfs_pwd = acct["password"]
+                mail_pwd = acct["mail_password"]
+                proxy = acct.get("proxy", "")
+                bot.send(f"Реактивация {i+1}/{len(with_mail)}: {email}...")
+
+                try:
+                    loop = asyncio.new_event_loop()
+                    result = loop.run_until_complete(
+                        _reactivate_account(email, vfs_pwd, mail_pwd, proxy,
+                                          progress_cb=bot.send))
+                    loop.close()
+
+                    if result == "already_active":
+                        already += 1
+                        bot.send(f"{email} — уже активен")
+                    elif result == "activated":
+                        ok += 1
+                        bot.send(f"{email} — АКТИВИРОВАН!")
+                    else:
+                        fail += 1
+                        bot.send(f"{email} — не удалось: {result}")
+                except Exception as e:
+                    fail += 1
+                    bot.send(f"{email} — ошибка: {e}")
+
+                if i < len(with_mail) - 1:
+                    time.sleep(random.uniform(5, 10))
+
+            bot.send(f"<b>Реактивация завершена:</b>\n"
+                     f"Уже активны: {already}\n"
+                     f"Активированы: {ok}\n"
+                     f"Не удалось: {fail}")
+
+        t = threading.Thread(target=do_reactivate, daemon=True, name="reactivate")
+        t.start()
+
     def _cmd_cleanbans(self):
         banned = get_banned_accounts()
         if not banned:
@@ -549,6 +699,8 @@ class TelegramBot:
             return f"error: {e}"
         finally:
             await checker.close_browser()
+
+    # ── Polling loop ───────────────────────────────────────────────
 
     def _poll_loop(self):
         logger.info("TG bot polling started")
