@@ -509,14 +509,6 @@ async def run_monitor():
         other_event = relay_events[1 - wid]
 
         while running:
-            try:
-                await asyncio.wait_for(my_event.wait(), timeout=300)
-            except asyncio.TimeoutError:
-                if not running:
-                    break
-                continue
-            my_event.clear()
-
             # Clean up stale entries from banned_emails (login-fail cooldowns)
             now = time.time()
             expired = [e for e, t in banned_emails.items() if now - t >= BAN_COOLDOWN]
@@ -532,13 +524,11 @@ async def run_monitor():
 
             if not available:
                 logger.warning("R%d: Нет доступных аккаунтов, жду 60с...", wid)
-                other_event.set()
                 await asyncio.sleep(60)
                 continue
 
             if is_quiet_hours():
                 logger.info("R%d: Тихие часы — сплю 10 мин", wid)
-                other_event.set()
                 await asyncio.sleep(600)
                 continue
 
@@ -554,7 +544,9 @@ async def run_monitor():
 
             signaled = False
             try:
+                # Phase 1: Login IMMEDIATELY (no wait for event)
                 stats.logins_total += 1
+                logger.info("%s Логин (warming параллельно)...", tag)
                 login_ok = await checker.login()
 
                 if checker.banned:
@@ -564,7 +556,6 @@ async def run_monitor():
                     await asyncio.to_thread(notify_error,
                         f"🚫 {tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nУдалён из БД. Replenisher создаст замену.")
                     await checker.close_browser()
-                    other_event.set()
                     continue
 
                 if not login_ok:
@@ -578,19 +569,29 @@ async def run_monitor():
                             f"⏸ {email.split('@')[0]}: 2 неудачных логина — пауза 30 мин")
                     consecutive_errors += 1
                     await checker.close_browser()
-                    other_event.set()
                     await asyncio.sleep(random.uniform(15, 30))
                     continue
 
-                await asyncio.to_thread(notify_status, f"{tag} залогинился, проверяю слоты")
                 consecutive_errors = 0
                 login_fails[email] = 0
+                logger.info("%s Залогинился, жду очередь на проверку слотов...", tag)
 
-                # Check both subcategories, twice each (4 checks total)
-                # Random pauses 10-15s between each — no timing pattern
-                # Signal other worker before last check so it starts login in parallel
+                # Phase 2: WAIT for turn to check slots (sequential access to VFS)
+                try:
+                    await asyncio.wait_for(my_event.wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    if not running:
+                        break
+                    logger.warning("%s Timeout ожидания очереди — пропускаю цикл", tag)
+                    await checker.close_browser()
+                    continue
+                my_event.clear()
+
+                await asyncio.to_thread(notify_status, f"{tag} очередь получена, проверяю слоты")
+
+                # Phase 3: Check slots
                 n_subs = len(Config.VFS_SUBCATEGORIES)
-                total_checks = 2 * n_subs  # 2 rounds × 2 subcategories = 4
+                total_checks = 2 * n_subs
                 check_num = 0
                 slot_found = False
 
@@ -601,7 +602,7 @@ async def run_monitor():
                         check_num += 1
                         stats.checks_total += 1
 
-                        # Signal other worker before last check — overlap login
+                        # Signal other worker before last check — it's already logged in, waiting
                         if check_num == total_checks - 1 and not signaled:
                             other_event.set()
                             signaled = True
@@ -626,7 +627,6 @@ async def run_monitor():
                                     f"{tag}\n{info}", screenshot)
                                 hot_mode_shared["until"] = time.time() + Config.HOT_MODE_DURATION
                                 hot_mode_shared["active"] = True
-                                # ATTACK MODE: launch all fighters
                                 sub_used = Config.VFS_SUBCATEGORIES[_sub_idx] if _sub_idx < len(Config.VFS_SUBCATEGORIES) else ""
                                 attack_task = asyncio.create_task(launch_fighters(sub_used, info))
                                 attack_task.add_done_callback(
@@ -644,7 +644,6 @@ async def run_monitor():
                             logger.error("%s Ошибка: %s", tag, e)
                             break
 
-                        # Random pause between checks — no pattern
                         await asyncio.sleep(random.uniform(10, 15))
 
                 logger.info("%s Проверка завершена (%d checks).", tag, check_num)
@@ -659,11 +658,9 @@ async def run_monitor():
                     other_event.set()
                     signaled = True
 
-            # Expire hot mode if needed
             if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
                 hot_mode_shared["active"] = False
 
-            # Short random pause before next turn
             pause = random.uniform(15, 40)
             logger.info("%s Пауза %.0fс", tag, pause)
             await asyncio.sleep(pause)
