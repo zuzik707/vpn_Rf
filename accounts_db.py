@@ -130,6 +130,35 @@ def reset_fails(email: str) -> None:
         conn.close()
 
 
+def ban_account(email: str, reason: str = "") -> bool:
+    """Отключает аккаунт и записывает причину бана в notes."""
+    conn = _conn()
+    try:
+        ban_time = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+        note = f"BANNED {ban_time}: {reason[:100]}"
+        cur = conn.execute(
+            "UPDATE accounts SET enabled = 0, notes = ? WHERE email = ?",
+            (note, email.strip().lower()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_banned_accounts() -> list[dict]:
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT email, notes, added_at "
+            "FROM accounts WHERE enabled = 0 AND notes LIKE 'BANNED%' "
+            "ORDER BY added_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def count_accounts(enabled_only: bool = True) -> int:
     conn = _conn()
     try:

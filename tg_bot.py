@@ -30,7 +30,7 @@ import requests
 from config import Config
 from accounts_db import (
     add_account, remove_account, toggle_account,
-    get_all_accounts, count_accounts,
+    get_all_accounts, count_accounts, get_banned_accounts,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,10 @@ class TelegramBot:
             self._cmd_toggle(arg, False)
         elif cmd == "/status":
             self._cmd_status()
+        elif cmd in ("/bans", "/banned"):
+            self._cmd_bans()
+        elif cmd == "/cleanbans":
+            self._cmd_cleanbans()
         elif cmd in ("/help", "/start"):
             self._cmd_help()
         elif cmd == "/cancel":
@@ -399,6 +403,33 @@ class TelegramBot:
                 f"Бот работает"
             )
 
+    def _cmd_bans(self):
+        banned = get_banned_accounts()
+        if not banned:
+            self.send("Забаненных аккаунтов нет")
+            return
+        lines = ["<b>Забаненные аккаунты:</b>\n"]
+        for a in banned:
+            notes = a.get("notes", "")
+            lines.append(f"• <code>{a['email']}</code>\n  {notes}")
+        lines.append(f"\nВсего: {len(banned)}")
+        lines.append("\n/delete email — удалить из базы")
+        lines.append("/cleanbans — удалить ВСЕ забаненные")
+        self.send("\n".join(lines))
+
+    def _cmd_cleanbans(self):
+        banned = get_banned_accounts()
+        if not banned:
+            self.send("Забаненных аккаунтов нет")
+            return
+        count = 0
+        for a in banned:
+            if remove_account(a["email"]):
+                count += 1
+        self.send(f"Удалено забаненных аккаунтов: {count}")
+        if count:
+            self._notify_accounts_changed()
+
     def _cmd_help(self):
         self.send(
             "<b>VFS Monitor Bot</b>\n\n"
@@ -412,6 +443,9 @@ class TelegramBot:
             "/list — все аккаунты\n"
             "/enable email — включить\n"
             "/disable email — выключить\n"
+            "/bans — забаненные аккаунты\n"
+            "/delete email — удалить аккаунт\n"
+            "/cleanbans — удалить все забаненные\n"
             "/status — статус мониторинга\n"
             "/cancel — отменить\n\n"
             "Каждому аккаунту свой IP через Bright Data"

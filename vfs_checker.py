@@ -99,6 +99,8 @@ class VFSBrowser:
         self.last_login_time: float = 0
         self._session_ttl: float = random.uniform(1500, 2400)
         self.cf_fail_count: int = 0
+        self.banned: bool = False
+        self.ban_reason: str = ""
 
     def set_credentials(self, email: str, password: str) -> None:
         self.email = email
@@ -810,10 +812,18 @@ class VFSBrowser:
         """Обработка любого препятствия (CF/captcha/blocked/session_expired) с fail-forward."""
         state = await self._page_state()
         if state == "blocked":
-            logger.error("BLOCKED!")
+            text = await self._text()
+            logger.error("BLOCKED! %s", text[:200])
             await self._screenshot("blocked")
             await dump_page(self.page, "blocked")
             self.cf_fail_count += 3
+            # Detect VFS account ban
+            if any(m in text for m in [
+                "access restricted", "restricted for user id",
+                "permission issues", "temporarily restricted",
+            ]):
+                self.banned = True
+                self.ban_reason = text[:150].strip()
             return False
         if state == "session_expired":
             logger.warning("Session expired — clearing cookies and restarting")

@@ -26,7 +26,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-from accounts_db import get_enabled_accounts, import_from_env, count_accounts
+from accounts_db import get_enabled_accounts, import_from_env, count_accounts, ban_account
 from budget_guard import BudgetGuard
 from config import Config
 from notifier import notify_error, notify_slots_found, notify_status
@@ -229,10 +229,24 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
                 login_ok = True
                 logger.info("%s Логин OK", tag)
                 break
+            if checker.banned:
+                break
             logger.warning("%s Логин не удался (попытка %d/3)", tag, login_attempt + 1)
             await checker.close_browser()
             if login_attempt < 2:
                 await asyncio.sleep(random.uniform(10, 20))
+
+        if checker.banned:
+            ban_account(email, checker.ban_reason)
+            logger.error("%s ЗАБАНЕН VFS: %s", tag, checker.ban_reason[:100])
+            await asyncio.to_thread(notify_error,
+                f"🚫 {tag} ЗАБАНЕН VFS!\n"
+                f"Причина: {checker.ban_reason[:100]}\n"
+                f"Аккаунт отключён. Бан обычно 12-24ч.\n"
+                f"Создай новый: /reg")
+            await checker.close_browser()
+            return
+
         if not login_ok:
             stats.logins_failed += 1
             logger.error("%s Логин не удался после 3 попыток", tag)
@@ -272,6 +286,17 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
                     checks_since_login = 0
 
                 found, info, screenshot = await checker.check_slots()
+
+                if checker.banned:
+                    ban_account(email, checker.ban_reason)
+                    logger.error("%s ЗАБАНЕН VFS: %s", tag, checker.ban_reason[:100])
+                    await asyncio.to_thread(notify_error,
+                        f"🚫 {tag} ЗАБАНЕН VFS!\n"
+                        f"Причина: {checker.ban_reason[:100]}\n"
+                        f"Аккаунт отключён. Бан обычно 12-24ч.\n"
+                        f"Создай новый: /reg")
+                    await checker.close_browser()
+                    return
 
                 if found:
                     stats.checks_success += 1
