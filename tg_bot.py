@@ -160,6 +160,8 @@ class TelegramBot:
             self._cmd_status()
         elif cmd in ("/bans", "/banned"):
             self._cmd_bans()
+        elif cmd == "/verify":
+            self._cmd_verify()
         elif cmd == "/cleanbans":
             self._cmd_cleanbans()
         elif cmd in ("/help", "/start"):
@@ -433,6 +435,58 @@ class TelegramBot:
         lines.append("/cleanbans — удалить ВСЕ забаненные")
         self.send("\n".join(lines))
 
+    def _cmd_verify(self):
+        """Check each account via VFS login — report active vs inactive."""
+        from accounts_db import get_enabled_accounts
+        accounts = get_enabled_accounts()
+        if not accounts:
+            self.send("Нет активных аккаунтов для проверки")
+            return
+        self.send(f"Проверяю {len(accounts)} аккаунтов через VFS логин...\n"
+                  f"Это займёт ~1-2 мин на каждый")
+
+        bot = self
+        def do_verify():
+            active = []
+            inactive = []
+            errors = []
+            for i, acct in enumerate(accounts):
+                email = acct["email"]
+                password = acct["password"]
+                proxy = acct.get("proxy", "")
+                bot.send(f"Проверка {i+1}/{len(accounts)}: {email}...")
+                try:
+                    loop = asyncio.new_event_loop()
+                    result = loop.run_until_complete(
+                        VFSBot._verify_account_vfs(email, password, proxy))
+                    loop.close()
+                    if result == "active":
+                        active.append(email)
+                    elif result == "inactive":
+                        inactive.append(email)
+                    else:
+                        errors.append(f"{email}: {result}")
+                except Exception as e:
+                    errors.append(f"{email}: {e}")
+
+            msg = f"<b>Проверка завершена:</b>\n\n"
+            msg += f"Активных: {len(active)}\n"
+            msg += f"Неактивных: {len(inactive)}\n"
+            if errors:
+                msg += f"Ошибки: {len(errors)}\n"
+            if inactive:
+                msg += f"\n<b>Неактивные:</b>\n"
+                for e in inactive:
+                    msg += f"• <code>{e}</code>\n"
+            if errors:
+                msg += f"\n<b>Ошибки:</b>\n"
+                for e in errors[:10]:
+                    msg += f"• {e}\n"
+            bot.send(msg)
+
+        t = threading.Thread(target=do_verify, daemon=True, name="verify")
+        t.start()
+
     def _cmd_cleanbans(self):
         banned = get_banned_accounts()
         if not banned:
@@ -462,12 +516,39 @@ class TelegramBot:
             "/bans — забаненные аккаунты\n"
             "/delete email — удалить аккаунт\n"
             "/cleanbans — удалить все забаненные\n"
+            "/verify — проверить все аккаунты (логин на VFS)\n"
             "/status — статус мониторинга\n"
             "/cancel — отменить\n\n"
             "Каждому аккаунту свой IP через Bright Data"
         )
 
     # ── Polling loop ───────────────────────────────────────────────
+
+    @staticmethod
+    async def _verify_account_vfs(email: str, password: str, proxy: str) -> str:
+        """Try VFS login. Returns 'active', 'inactive', 'banned', or error string."""
+        from vfs_checker import VFSBrowser
+        checker = VFSBrowser(email, password, proxy)
+        try:
+            await checker.start_browser()
+            await checker.warm_session()
+            login_ok = await checker.login()
+            if checker.banned:
+                return "banned"
+            if login_ok:
+                return "active"
+            # Check page text for "inactive"
+            text = ""
+            if checker.page:
+                text = (await checker.page.evaluate(
+                    "document.body?.innerText || ''") or "").lower()
+            if "currently inactive" in text or "inactive" in text:
+                return "inactive"
+            return f"login failed: {text[:100]}"
+        except Exception as e:
+            return f"error: {e}"
+        finally:
+            await checker.close_browser()
 
     def _poll_loop(self):
         logger.info("TG bot polling started")
