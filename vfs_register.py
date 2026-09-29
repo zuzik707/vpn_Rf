@@ -657,9 +657,9 @@ async def register_account(email: str = "", proxy_url: str = "",
     # If first activation failed, try resending via the VFS login page
     if not act_result.get("success") and mail_client:
         if progress_cb:
-            progress_cb("Первая активация не сработала. Пробую resend...")
+            progress_cb("Первая активация не сработала. Пробую resend через логин...")
         resend_ok = await _try_resend_activation(
-            created_email, proxy_url, mail_client, progress_cb)
+            created_email, proxy_url, mail_client, progress_cb, password=password)
         if resend_ok:
             act_result = {"success": True}
 
@@ -680,21 +680,87 @@ async def register_account(email: str = "", proxy_url: str = "",
 
 
 async def _try_resend_activation(email: str, proxy_url: str,
-                                  mail_client, progress_cb=None) -> bool:
-    """Go to VFS login page, click 'resend activation email', wait for new email, activate."""
+                                  mail_client, progress_cb=None,
+                                  password: str = "") -> bool:
+    """Sign in with inactive account to trigger 'resend activation', then activate."""
     resender = VFSRegistrar(proxy_url=proxy_url)
     try:
         await resender.start_browser()
         resender.page = await resender.browser.get(REG_URL)
+        await resender._delay(5, 8)
+
+        # Wait for page / Cloudflare
+        for _ in range(15):
+            text = (await resender.page.evaluate(
+                "document.body?.innerText || ''") or "").lower()
+            if "sign in" in text or "email" in text:
+                break
+            await resender._delay(2, 3)
+
+        # Fill email + password and click Sign In to trigger "inactive" message
+        email_js = _js_str(email)
+        pwd_js = _js_str(password)
+        await resender.page.evaluate(f"""
+            (() => {{
+                const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value').set;
+                const emailInp = document.querySelector(
+                    'input[formcontrolname="emailid"], input#inputEmail, input[type="email"]');
+                const pwdInp = document.querySelector(
+                    'input[formcontrolname="password"], input[type="password"]');
+                if (emailInp) {{
+                    setter.call(emailInp, {email_js});
+                    emailInp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    emailInp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }}
+                if (pwdInp) {{
+                    setter.call(pwdInp, {pwd_js});
+                    pwdInp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    pwdInp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                }}
+            }})()
+        """)
+        await resender._delay(1, 2)
+
+        # Wait for Turnstile
+        for _ in range(20):
+            ts_ok = await resender.page.evaluate("""
+                (() => {
+                    const el = document.querySelector('[name="cf-turnstile-response"]');
+                    return el && el.value && el.value.length > 20;
+                })()
+            """)
+            if ts_ok:
+                break
+            await resender._delay(1.5, 2.5)
+
+        # Click Sign In
+        await resender.page.evaluate("""
+            (() => {
+                const btns = document.querySelectorAll('button, input[type="submit"]');
+                for (const b of btns) {
+                    const t = b.textContent.toLowerCase().trim();
+                    if (t === 'sign in' || t === 'login' || t === 'log in') {
+                        b.click(); return true;
+                    }
+                }
+                return false;
+            })()
+        """)
         await resender._delay(4, 6)
 
+        # Now look for "click here" to resend activation
         text = (await resender.page.evaluate(
             "document.body?.innerText || ''") or "").lower()
 
-        # Look for "click here" or "resend" link on the page
+        if "currently inactive" not in text:
+            logger.info("No 'inactive' message after sign-in attempt")
+            await resender._screenshot("resend_no_inactive")
+            return False
+
         clicked_resend = await resender.page.evaluate("""
             (() => {
-                const links = document.querySelectorAll('a, button, span');
+                const links = document.querySelectorAll('a');
                 for (const el of links) {
                     const t = el.textContent.toLowerCase().trim();
                     if (t.includes('click here') || t.includes('resend') ||
@@ -708,12 +774,11 @@ async def _try_resend_activation(email: str, proxy_url: str,
         """)
 
         if not clicked_resend:
-            logger.warning("Resend activation link not found on page")
+            logger.warning("Resend link not found on inactive page")
+            await resender._screenshot("resend_link_not_found")
             return False
 
         await resender._delay(3, 5)
-
-        # Check if resend was successful
         text = (await resender.page.evaluate(
             "document.body?.innerText || ''") or "").lower()
         if "sent" in text or "resent" in text or "check your email" in text:

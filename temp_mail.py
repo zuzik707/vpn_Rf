@@ -214,31 +214,34 @@ class TempMailClient:
 
     def extract_activation_link(self, message: dict) -> str | None:
         """Извлекает ссылку активации из письма VFS."""
-        # Проверяем HTML тело
         html_parts = message.get("html", [])
         html_body = "".join(html_parts) if isinstance(html_parts, list) else str(html_parts)
 
-        # Ищем ссылку активации VFS
+        # VFS activation URLs span multiple lines in email HTML —
+        # first extract href values, joining across line breaks
+        href_matches = re.findall(
+            r'href=["\']([^"\']+)["\']', html_body, re.IGNORECASE | re.DOTALL)
+        for href in href_matches:
+            # Remove newlines/whitespace that email clients insert
+            clean = re.sub(r'\s+', '', href)
+            if 'activat' in clean.lower() and 'vfsglobal' in clean.lower():
+                logger.info("Activation link found (href): %s", clean[:100])
+                return clean
+
+        # Fallback: look in plain text with single-line patterns
+        combined = html_body + " " + message.get("text", "")
+        # Remove newlines inside URLs (between non-whitespace chars)
+        combined_clean = re.sub(r'(\S)\n(\S)', r'\1\2', combined)
         patterns = [
             r'https?://visa\.vfsglobal\.com[^\s"\'<>]+activat[^\s"\'<>]+',
             r'https?://[^\s"\'<>]*vfsglobal[^\s"\'<>]*activat[^\s"\'<>]+',
-            r'href=["\']?(https?://[^\s"\'<>]*activat[^\s"\'<>]+)',
         ]
         for pat in patterns:
-            match = re.search(pat, html_body, re.IGNORECASE)
+            match = re.search(pat, combined_clean, re.IGNORECASE)
             if match:
-                link = match.group(1) if match.lastindex else match.group(0)
-                link = link.rstrip('"\'>')
-                logger.info("Activation link found: %s", link[:80])
+                link = match.group(0).rstrip('"\'>')
+                logger.info("Activation link found (text): %s", link[:100])
                 return link
-
-        # Fallback — проверяем текстовое тело
-        text_body = message.get("text", "")
-        for pat in patterns:
-            match = re.search(pat, text_body, re.IGNORECASE)
-            if match:
-                link = match.group(1) if match.lastindex else match.group(0)
-                return link.rstrip('"\'>')
 
         logger.warning("Activation link not found in email")
         return None
