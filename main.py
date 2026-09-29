@@ -26,7 +26,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-from accounts_db import get_enabled_accounts, import_from_env, count_accounts, ban_account
+from accounts_db import get_enabled_accounts, import_from_env, count_accounts, ban_account, toggle_account
 from budget_guard import BudgetGuard
 from config import Config
 from notifier import notify_error, notify_slots_found, notify_status
@@ -492,13 +492,12 @@ async def run_monitor():
     # The other worker picks up immediately with a different account.
     # With 20 accounts: each account visits ~once per 15-20 min (natural),
     # but combined coverage = one check every ~30-60s across all accounts.
-    banned_emails: set[str] = set()
+    BAN_COOLDOWN = 1800  # 30 min auto-unban
+    banned_emails: dict[str, float] = {}  # email → ban timestamp
     relay_events = [asyncio.Event(), asyncio.Event()]
     relay_events[0].set()  # Worker 0 starts immediately
 
     async def relay_worker(wid: int):
-        # Use worker_id 10+wid to avoid port conflicts with registration (worker 99)
-        # and old parallel workers (0-N)
         proxy_wid = 10 + wid
         consecutive_errors = 0
         my_event = relay_events[wid]
@@ -507,6 +506,16 @@ async def run_monitor():
         while running:
             await my_event.wait()
             my_event.clear()
+
+            # Auto-unban accounts after 30 min cooldown
+            now = time.time()
+            unbanned = [e for e, t in banned_emails.items() if now - t >= BAN_COOLDOWN]
+            for email_ub in unbanned:
+                del banned_emails[email_ub]
+                toggle_account(email_ub, True)
+                logger.info("Auto-unban: %s (30 мин прошло, включаю обратно)", email_ub)
+                await asyncio.to_thread(notify_status,
+                    f"♻️ Auto-unban: {email_ub.split('@')[0]}\n30 мин прошло — включаю обратно для проверки")
 
             db_accounts = get_enabled_accounts()
             available = [a for a in db_accounts if a["email"] not in banned_emails]
@@ -540,10 +549,10 @@ async def run_monitor():
 
                 if checker.banned:
                     ban_account(email, checker.ban_reason)
-                    banned_emails.add(email)
+                    banned_emails[email] = time.time()
                     logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
                     await asyncio.to_thread(notify_error,
-                        f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nАккаунт отключён.")
+                        f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nАвто-включу через 30 мин.")
                     await checker.close_browser()
                     other_event.set()
                     continue
@@ -585,10 +594,10 @@ async def run_monitor():
 
                             if checker.banned:
                                 ban_account(email, checker.ban_reason)
-                                banned_emails.add(email)
+                                banned_emails[email] = time.time()
                                 logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
                                 await asyncio.to_thread(notify_error,
-                                    f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}")
+                                    f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nАвто-включу через 30 мин.")
                                 slot_found = True
                                 break
 
