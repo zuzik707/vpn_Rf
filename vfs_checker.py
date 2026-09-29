@@ -2075,6 +2075,7 @@ class VFSBrowser:
         await self._delay(3, 5)
 
         # Wait for file to appear + Click "Continue" button in the upload area
+        uploaded = False
         for attempt in range(10):
             uploaded = await self.page.evaluate("""
                 (() => {
@@ -2086,6 +2087,11 @@ class VFSBrowser:
             if uploaded:
                 break
             await asyncio.sleep(2)
+
+        if not uploaded:
+            logger.error("[F%d] Passport upload not confirmed", self.worker_id)
+            await self._screenshot("passport_upload_timeout", send_tg=True)
+            return False
 
         # Click "Continue" in upload area (button.file-browse.fs-22 with text "Continue")
         clicked = await self.page.evaluate("""
@@ -2140,6 +2146,10 @@ class VFSBrowser:
             if ocr_done:
                 logger.info("[F%d] OCR completed, fields filled", self.worker_id)
                 break
+        else:
+            logger.error("[F%d] OCR timed out — form fields not filled", self.worker_id)
+            await self._screenshot("fighter_ocr_timeout", send_tg=True)
+            return False
 
         await self._delay(1, 2)
         await self._screenshot("fighter_ocr_done", send_tg=True)
@@ -2158,6 +2168,7 @@ class VFSBrowser:
                         nv.set.call(inp, '998');
                         inp.dispatchEvent(new Event('input', {bubbles: true}));
                         inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        inp.dispatchEvent(new Event('blur', {bubbles: true}));
                     }
                 }
                 // Phone number — set dummy if empty (VFS requires it but doesn't verify)
@@ -2171,6 +2182,7 @@ class VFSBrowser:
                         nv.set.call(inp, '901234567');
                         inp.dispatchEvent(new Event('input', {bubbles: true}));
                         inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        inp.dispatchEvent(new Event('blur', {bubbles: true}));
                     }
                 }
             })()
@@ -2291,6 +2303,10 @@ class VFSBrowser:
             await self._screenshot("otp_timeout")
             return False
 
+        otp = otp.strip()
+        if not otp.isdigit():
+            logger.error("[F%d] Invalid OTP format: %r", self.worker_id, otp)
+            return False
         logger.info("[F%d] Got OTP: %s", self.worker_id, otp)
 
         # Enter OTP in input field
@@ -2353,19 +2369,35 @@ class VFSBrowser:
         await self._delay(3, 5)
 
         # Check verification success
+        verified_ok = False
         for _ in range(10):
             verified = await self.page.evaluate("""
                 (() => {
                     const text = (document.body.innerText || '').toLowerCase();
-                    return text.includes('otp verification successful') ||
-                           text.includes('verified successfully') ||
-                           text.includes('verification successful');
+                    if (text.includes('otp verification successful') ||
+                        text.includes('verified successfully') ||
+                        text.includes('verification successful'))
+                        return 'ok';
+                    if (text.includes('invalid otp') || text.includes('otp expired') ||
+                        text.includes('incorrect otp'))
+                        return 'failed';
+                    return null;
                 })()
             """)
-            if verified:
+            if verified == 'ok':
                 logger.info("[F%d] OTP verified successfully!", self.worker_id)
+                verified_ok = True
                 break
+            if verified == 'failed':
+                logger.error("[F%d] OTP verification FAILED", self.worker_id)
+                await self._screenshot("otp_verify_failed", send_tg=True)
+                return False
             await asyncio.sleep(2)
+
+        if not verified_ok:
+            logger.error("[F%d] OTP verification not confirmed in time", self.worker_id)
+            await self._screenshot("otp_verify_timeout", send_tg=True)
+            return False
 
         await self._screenshot("fighter_otp_verified", send_tg=True)
 
@@ -2411,44 +2443,40 @@ class VFSBrowser:
         await self._screenshot("fighter_calendar", send_tg=True)
         await self._delay(1, 2)
 
-        # Click first available date (green border / not greyed out)
+        # Click first AVAILABLE date (green background, not grey/unavailable)
         date_clicked = await self.page.evaluate("""
             (() => {
-                // FullCalendar: look for clickable day cells
-                const dayCells = document.querySelectorAll(
-                    'a.fc-daygrid-day-number, td.fc-daygrid-day, .fc-day'
-                );
-                for (const cell of dayCells) {
-                    const td = cell.closest('td') || cell;
+                // FullCalendar: look for day cells with availability indicator
+                const dayCells = document.querySelectorAll('td.fc-daygrid-day');
+                for (const td of dayCells) {
                     const classes = td.className || '';
-                    // Skip disabled/past/other-month days
                     if (classes.includes('fc-day-disabled') || classes.includes('fc-day-past') ||
                         classes.includes('fc-day-other')) continue;
-                    // Check if clickable (available)
+                    // Check for green background (available) vs grey/white (unavailable)
                     const bg = window.getComputedStyle(td).backgroundColor;
-                    const border = window.getComputedStyle(td).borderColor;
-                    const link = td.querySelector('a');
-                    if (link) {
-                        link.click();
-                        return td.getAttribute('data-date') || link.textContent.trim();
-                    }
-                    td.click();
+                    const hasBgEvent = td.querySelector('.fc-bg-event, .fc-event');
+                    const isAvailable = classes.includes('fc-day-available') ||
+                        classes.includes('available') || hasBgEvent ||
+                        (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent' &&
+                         bg !== 'rgb(255, 255, 255)' && bg !== 'rgb(245, 245, 245)' &&
+                         bg !== 'rgb(238, 238, 238)');
+                    if (!isAvailable) continue;
+                    const link = td.querySelector('a.fc-daygrid-day-number');
+                    if (link) { link.click(); }
+                    else { td.click(); }
                     return td.getAttribute('data-date') || td.textContent.trim();
                 }
-                // Fallback: click any day number link
-                const links = document.querySelectorAll('a.fc-daygrid-day-number');
-                for (const a of links) {
-                    const td = a.closest('td');
-                    if (td && !td.classList.contains('fc-day-disabled')) {
-                        a.click();
-                        return td.getAttribute('data-date') || a.textContent.trim();
+                // Fallback: look for cells with green-ish background event overlays
+                for (const ev of document.querySelectorAll('.fc-bg-event, .fc-event')) {
+                    const td = ev.closest('td.fc-daygrid-day');
+                    if (td) {
+                        const link = td.querySelector('a');
+                        if (link) link.click(); else td.click();
+                        return td.getAttribute('data-date') || td.textContent.trim();
                     }
                 }
-                // Alternative calendar format: plain date buttons/links
-                const dateBtns = document.querySelectorAll(
-                    '[class*="available"], [class*="active-date"], button[class*="date"]'
-                );
-                for (const b of dateBtns) {
+                // Alternative: date buttons/links explicitly marked available
+                for (const b of document.querySelectorAll('[class*="available"], [class*="active-date"]')) {
                     if (!b.disabled) {
                         b.click();
                         return b.textContent.trim();
@@ -2586,28 +2614,30 @@ class VFSBrowser:
         await self._screenshot("fighter_review", send_tg=True)
         await self._delay(1, 2)
 
-        # Click Confirm button (id="trigger" or class="ot-submit-button" or orange button)
+        # Click Confirm button — check text to avoid clicking cookie/consent buttons
         confirmed = await self.page.evaluate("""
             (() => {
-                // Primary: button#trigger
-                const trigger = document.querySelector('button#trigger');
-                if (trigger && !trigger.disabled) { trigger.click(); return 'trigger'; }
-                // Secondary: ot-submit-button class
-                const otBtn = document.querySelector('button.ot-submit-button');
-                if (otBtn && !otBtn.disabled) { otBtn.click(); return 'ot-submit'; }
-                // Tertiary: any Confirm button
                 const btns = document.querySelectorAll('button');
+                // Primary: orange Confirm button
+                for (const b of btns) {
+                    const t = b.textContent.trim().toLowerCase();
+                    if (t === 'confirm' && !b.disabled &&
+                        (b.classList.contains('btn-brand-orange') ||
+                         b.classList.contains('mat-mdc-raised-button'))) {
+                        b.click(); return 'orange-confirm';
+                    }
+                }
+                // Secondary: button#trigger but only if its text says confirm
+                const trigger = document.querySelector('button#trigger');
+                if (trigger && !trigger.disabled &&
+                    trigger.textContent.trim().toLowerCase().includes('confirm')) {
+                    trigger.click(); return 'trigger';
+                }
+                // Tertiary: any button with confirm text
                 for (const b of btns) {
                     const t = b.textContent.trim().toLowerCase();
                     if (t === 'confirm' && !b.disabled) {
                         b.click(); return 'text-match';
-                    }
-                }
-                // Orange button with confirm text
-                for (const b of btns) {
-                    if (b.textContent.trim().toLowerCase().includes('confirm') &&
-                        b.classList.contains('btn-brand-orange') && !b.disabled) {
-                        b.click(); return 'orange-confirm';
                     }
                 }
                 return null;

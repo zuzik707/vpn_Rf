@@ -704,6 +704,8 @@ async def run_monitor():
             fighter_tasks = []
             fighter_id_base = 100  # worker IDs 100+ for fighters
 
+            booked_events: dict[int, asyncio.Event] = {}
+
             for applicant_id, acct_list in fighter_groups.items():
                 applicant = applicants[applicant_id]
                 passport = applicant.get("passport_file", "")
@@ -712,6 +714,8 @@ async def run_monitor():
                 if not passport or not os.path.exists(passport):
                     logger.error("No passport file for %s: %s", name, passport)
                     continue
+
+                booked_events[applicant_id] = asyncio.Event()
 
                 for i, acct in enumerate(acct_list[:Config.MAX_FIGHTERS]):
                     fid = fighter_id_base + len(fighter_tasks)
@@ -724,6 +728,7 @@ async def run_monitor():
                         _run_single_fighter(
                             fid, acct, applicant, subcategory, stagger,
                             solver, stats,
+                            booked_event=booked_events[applicant_id],
                         )
                     )
                     fighter_tasks.append((task, acct, applicant))
@@ -771,7 +776,8 @@ async def run_monitor():
 
     async def _run_single_fighter(fid: int, acct: dict, applicant: dict,
                                    subcategory: str, stagger: float,
-                                   captcha_solver, fight_stats: SessionStats):
+                                   captcha_solver, fight_stats: SessionStats,
+                                   booked_event: asyncio.Event | None = None):
         """Run a single fighter browser instance."""
         email = acct["email"]
         proxy_url = acct.get("proxy") or Config.PROXY_URL
@@ -783,6 +789,10 @@ async def run_monitor():
         if stagger > 0:
             logger.info("%s Stagger wait %.1fs", tag, stagger)
             await asyncio.sleep(stagger)
+
+        if booked_event and booked_event.is_set():
+            logger.info("%s Skipping — already booked by another fighter", tag)
+            return {"success": False, "step": "skipped", "error": "already booked"}
 
         checker = VFSBrowser(
             captcha_solver=captcha_solver, email=email, password=acct["password"],
@@ -798,6 +808,8 @@ async def run_monitor():
                 subcategory=subcategory,
             )
             if result.get("success"):
+                if booked_event:
+                    booked_event.set()
                 logger.info("%s BOOKED! %s %s", tag,
                            result.get("booked_date"), result.get("booked_time"))
                 await asyncio.to_thread(notify_slots_found,
