@@ -1841,6 +1841,7 @@ class VFSBrowser:
         """
         result = {"success": False, "step": "", "error": "", "booked_date": "", "booked_time": ""}
         sub = subcategory or Config.VFS_SUBCATEGORIES[0]
+        tag = f"F{self.worker_id}:{self.email.split('@')[0]}→{applicant_name}"
 
         try:
             # Step 0: Login
@@ -1848,7 +1849,9 @@ class VFSBrowser:
             if not self.logged_in:
                 if not await self.login():
                     result["error"] = "Login failed"
+                    await self._screenshot(f"fighter_login_fail_{tag}", send_tg=True)
                     return result
+            await self._screenshot(f"fighter_login_ok_{tag}", send_tg=True)
             logger.info("[F%d] Login OK for %s, starting booking for %s",
                         self.worker_id, self.email, applicant_name)
 
@@ -1904,7 +1907,9 @@ class VFSBrowser:
             found, info, _ = await self._read_slot_result(sub)
             if not found:
                 result["error"] = f"No slots available: {info}"
+                await self._screenshot(f"fighter_no_slots_{tag}", send_tg=True)
                 return result
+            await self._screenshot(f"fighter_slots_ok_{tag}", send_tg=True)
             logger.info("[F%d] Slots confirmed! Advancing to step 2...", self.worker_id)
 
             # Click Continue (step 1 → step 2) + wait timer
@@ -2067,7 +2072,7 @@ class VFSBrowser:
         """)
         logger.info("[F%d] Upload continue click: %s", self.worker_id, clicked)
         await self._delay(3, 5)
-        await self._screenshot("after_passport_upload")
+        await self._screenshot("fighter_passport_uploaded", send_tg=True)
         return bool(clicked)
 
     async def _fighter_wait_ocr_and_save(self) -> bool:
@@ -2097,7 +2102,7 @@ class VFSBrowser:
                 break
 
         await self._delay(1, 2)
-        await self._screenshot("after_ocr")
+        await self._screenshot("fighter_ocr_done", send_tg=True)
 
         # Check if contact number fields need filling (they might not be auto-filled)
         await self.page.evaluate("""
@@ -2172,7 +2177,7 @@ class VFSBrowser:
                 break
             await asyncio.sleep(2)
 
-        await self._screenshot("details_summary")
+        await self._screenshot("fighter_details_summary", send_tg=True)
 
         # Click Continue on summary page
         clicked = await self.page.evaluate("""
@@ -2215,7 +2220,7 @@ class VFSBrowser:
                 break
             await asyncio.sleep(2)
 
-        await self._screenshot("otp_page")
+        await self._screenshot("fighter_otp_page", send_tg=True)
 
         # Click "Generate OTP" button
         gen_clicked = await self.page.evaluate("""
@@ -2322,7 +2327,7 @@ class VFSBrowser:
                 break
             await asyncio.sleep(2)
 
-        await self._screenshot("otp_verified")
+        await self._screenshot("fighter_otp_verified", send_tg=True)
 
         # Click Continue after OTP (orange button)
         clicked = await self.page.evaluate("""
@@ -2363,7 +2368,7 @@ class VFSBrowser:
                 break
             await asyncio.sleep(2)
 
-        await self._screenshot("calendar_page")
+        await self._screenshot("fighter_calendar", send_tg=True)
         await self._delay(1, 2)
 
         # Click first available date (green border / not greyed out)
@@ -2470,7 +2475,7 @@ class VFSBrowser:
 
         logger.info("[F%d] Time selected: %s", self.worker_id, time_info)
         await self._delay(2, 3)
-        await self._screenshot("after_time_select")
+        await self._screenshot("fighter_time_selected", send_tg=True)
 
         return (str(date_clicked), str(time_info))
 
@@ -2490,7 +2495,7 @@ class VFSBrowser:
                 break
             await asyncio.sleep(2)
 
-        await self._screenshot("services_page")
+        await self._screenshot("fighter_services", send_tg=True)
         await self._delay(1, 2)
 
         # Click Continue (don't add any services)
@@ -2538,7 +2543,7 @@ class VFSBrowser:
                 break
             await asyncio.sleep(2)
 
-        await self._screenshot("review_page")
+        await self._screenshot("fighter_review", send_tg=True)
         await self._delay(1, 2)
 
         # Click Confirm button (id="trigger" or class="ot-submit-button" or orange button)
