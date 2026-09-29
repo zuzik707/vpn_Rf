@@ -1318,13 +1318,22 @@ class VFSBrowser:
                     await asyncio.sleep(2)
 
                 if not token_ready:
-                    html = await self._html()
-                    if any(m in html for m in CAPTCHA_MARKERS):
-                        logger.info("CAPTCHA на форме логина — Turnstile не решился за 30с, пробуем вручную...")
-                        await self._solve_turnstile()
-                        await self._delay(1, 2)
-                    else:
-                        logger.info("No captcha markers found — proceeding without token")
+                    # Try clicking the Turnstile widget to trigger it
+                    logger.info("Turnstile не решился за 30с — пробуем кликнуть виджет...")
+                    for _click_try in range(3):
+                        await self._try_turnstile_click()
+                        await asyncio.sleep(5)
+                        token_ready = await self.page.evaluate("""
+                            (() => {
+                                const el = document.querySelector('[name="cf-turnstile-response"]');
+                                return el && el.value && el.value.length > 20;
+                            })()
+                        """)
+                        if token_ready:
+                            logger.info("Turnstile solved after click (attempt %d)", _click_try + 1)
+                            break
+                    if not token_ready:
+                        logger.warning("Turnstile не решился — продолжаем без токена (Submit может триггернуть)")
 
                 # Submit — кнопка "Sign In" (mat-stroked-button btn-brand-orange)
                 if not await self._click([
