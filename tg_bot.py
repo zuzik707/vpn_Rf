@@ -330,13 +330,23 @@ class TelegramBot:
         t.start()
 
     def _run_batch_registration(self, count: int):
-        if count < 1 or count > 20:
-            self.send("Количество: от 1 до 20")
+        if count < 1 or count > 30:
+            self.send("Количество: от 1 до 30")
             return
-        self.send(f"Запускаю регистрацию {count} аккаунтов...")
-        for i in range(count):
-            self._run_registration("")
-            time.sleep(2)  # small gap between launches
+        self.send(f"Запускаю регистрацию {count} аккаунтов последовательно...\n"
+                  f"Пауза 30-60с между каждым чтобы не словить 429")
+
+        bot = self
+        def do_batch():
+            for i in range(count):
+                bot.send(f"Регистрация {i+1}/{count}...")
+                bot._run_registration("")
+                if i < count - 1:
+                    pause = random.uniform(30, 60)
+                    time.sleep(pause)
+
+        t = threading.Thread(target=do_batch, daemon=True, name="batch-reg")
+        t.start()
 
     # ── Остальные команды ──────────────────────────────────────────
 

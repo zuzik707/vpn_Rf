@@ -76,9 +76,9 @@ class TempMailClient:
         self.address = f"{prefix}@{domain}"
         self.password = f"TmpPass_{int(time.time())}!"
 
-        # Создаём аккаунт (до 3 попыток с разными адресами)
+        # Создаём аккаунт (до 5 попыток с backoff на 429)
         created = False
-        for attempt in range(3):
+        for attempt in range(5):
             resp = self._session.post(
                 f"{BASE_URL}/accounts",
                 json={"address": self.address, "password": self.password},
@@ -88,14 +88,21 @@ class TempMailClient:
                 created = True
                 break
             if resp.status_code == 422:
-                # Адрес занят — генерируем новый
                 prefix = _random_human_prefix()
                 self.address = f"{prefix}@{domain}"
+                continue
+            if resp.status_code == 429:
+                wait = (attempt + 1) * 15
+                logger.warning("mail.tm 429 — waiting %ds (attempt %d/5)", wait, attempt + 1)
+                time.sleep(wait)
+                prefix = _random_human_prefix()
+                self.address = f"{prefix}@{domain}"
+                self.password = f"TmpPass_{int(time.time())}!"
                 continue
             resp.raise_for_status()
 
         if not created:
-            raise RuntimeError(f"Не удалось создать аккаунт за 3 попытки (последний: {self.address})")
+            raise RuntimeError(f"Не удалось создать аккаунт за 5 попыток (последний: {self.address})")
 
         # Получаем токен (retry если 401 — иногда задержка между созданием и авторизацией)
         token_resp = None
