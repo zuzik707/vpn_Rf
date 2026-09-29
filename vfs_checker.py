@@ -1297,21 +1297,28 @@ class VFSBrowser:
                 await self._human_type(pwd_el, self.password)
                 await self._delay(0.6, 1.2)
 
-                # Может быть captcha на форме логина — но часто Turnstile решается сам
-                token_ready = await self.page.evaluate("""
-                    (() => {
-                        const el = document.querySelector('[name="cf-turnstile-response"]');
-                        return el && el.value && el.value.length > 20;
-                    })()
-                """)
-                if token_ready:
-                    logger.info("Turnstile уже решён автоматически — токен заполнен")
-                else:
+                # Invisible Turnstile on login form — wait for auto-solve first
+                token_ready = False
+                for _tw in range(15):
+                    token_ready = await self.page.evaluate("""
+                        (() => {
+                            const el = document.querySelector('[name="cf-turnstile-response"]');
+                            return el && el.value && el.value.length > 20;
+                        })()
+                    """)
+                    if token_ready:
+                        logger.info("Turnstile auto-solved (wait %ds)", _tw + 1)
+                        break
+                    await asyncio.sleep(2)
+
+                if not token_ready:
                     html = await self._html()
                     if any(m in html for m in CAPTCHA_MARKERS):
-                        logger.info("CAPTCHA на форме логина — решаем...")
+                        logger.info("CAPTCHA на форме логина — Turnstile не решился за 30с, пробуем вручную...")
                         await self._solve_turnstile()
                         await self._delay(1, 2)
+                    else:
+                        logger.info("No captcha markers found — proceeding without token")
 
                 # Submit — кнопка "Sign In" (mat-stroked-button btn-brand-orange)
                 if not await self._click([
