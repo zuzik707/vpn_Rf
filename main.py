@@ -500,6 +500,7 @@ async def run_monitor():
     # but combined coverage = one check every ~30-60s across all accounts.
     BAN_COOLDOWN = 1800  # 30 min auto-unban
     banned_emails: dict[str, float] = {}  # email → ban timestamp
+    login_fails: dict[str, int] = {}  # email → consecutive login failures
     relay_events = [asyncio.Event(), asyncio.Event()]
     relay_events[0].set()  # Worker 0 starts immediately
 
@@ -523,6 +524,7 @@ async def run_monitor():
             unbanned = [e for e, t in banned_emails.items() if now - t >= BAN_COOLDOWN]
             for email_ub in unbanned:
                 del banned_emails[email_ub]
+                login_fails.pop(email_ub, None)
                 toggle_account(email_ub, True)
                 logger.info("Auto-unban: %s (30 мин прошло, включаю обратно)", email_ub)
                 await asyncio.to_thread(notify_status,
@@ -572,7 +574,13 @@ async def run_monitor():
 
                 if not login_ok:
                     stats.logins_failed += 1
-                    logger.warning("%s Логин не удался", tag)
+                    login_fails[email] = login_fails.get(email, 0) + 1
+                    logger.warning("%s Логин не удался (fail #%d)", tag, login_fails[email])
+                    if login_fails[email] >= 2:
+                        banned_emails[email] = time.time()
+                        logger.warning("%s 2+ login fails — пауза 30 мин для %s", tag, email.split('@')[0])
+                        await asyncio.to_thread(notify_status,
+                            f"⏸ {email.split('@')[0]}: 2 неудачных логина — пауза 30 мин")
                     consecutive_errors += 1
                     await checker.close_browser()
                     other_event.set()
@@ -581,6 +589,7 @@ async def run_monitor():
 
                 await asyncio.to_thread(notify_status, f"{tag} залогинился, проверяю слоты")
                 consecutive_errors = 0
+                login_fails[email] = 0
 
                 # Check both subcategories, twice each (4 checks total)
                 # Random pauses 10-15s between each — no timing pattern
