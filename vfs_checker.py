@@ -1384,6 +1384,10 @@ class VFSBrowser:
         if final_state in ("login", "cloudflare", "captcha", "blocked", "session_expired"):
             logger.error("Логин не удался (final_state=%s)", final_state)
             await self._screenshot("login_failed")
+            if final_state == "blocked":
+                self.banned = True
+                self.ban_reason = f"final_state=blocked after login attempts"
+                logger.error("Account BLOCKED at final state — marking banned")
             if final_state == "session_expired":
                 try:
                     if os.path.exists(self._cookies_path):
