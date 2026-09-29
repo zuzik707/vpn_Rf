@@ -558,12 +558,25 @@ async def run_monitor():
 
                 # Check both subcategories, twice each (4 checks total)
                 # Random pauses 10-15s between each — no timing pattern
+                # Signal other worker before last check so it starts login in parallel
+                n_subs = len(Config.VFS_SUBCATEGORIES)
+                total_checks = 2 * n_subs  # 2 rounds × 2 subcategories = 4
+                check_num = 0
                 slot_found = False
+                signaled = False
+
                 for round_num in range(2):
                     if slot_found:
                         break
-                    for _sub_idx in range(len(Config.VFS_SUBCATEGORIES)):
+                    for _sub_idx in range(n_subs):
+                        check_num += 1
                         stats.checks_total += 1
+
+                        # Signal other worker before last check — overlap login
+                        if check_num == total_checks - 1 and not signaled:
+                            other_event.set()
+                            signaled = True
+
                         try:
                             found, info, screenshot = await checker.check_slots()
 
@@ -573,7 +586,7 @@ async def run_monitor():
                                 logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
                                 await asyncio.to_thread(notify_error,
                                     f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}")
-                                slot_found = True  # break out
+                                slot_found = True
                                 break
 
                             if found:
@@ -598,7 +611,7 @@ async def run_monitor():
                         # Random pause between checks — no pattern
                         await asyncio.sleep(random.uniform(10, 15))
 
-                logger.info("%s Проверка завершена. Передаю эстафету.", tag)
+                logger.info("%s Проверка завершена (%d checks).", tag, check_num)
 
             except Exception as e:
                 stats.checks_failed += 1
@@ -607,10 +620,11 @@ async def run_monitor():
             finally:
                 await checker.close_browser()
 
-            # Signal the other worker to go
-            other_event.set()
+            # Signal other worker if not yet (error/ban path)
+            if not signaled:
+                other_event.set()
 
-            # Short sleep before next turn (other worker is already checking)
+            # Short random pause before next turn
             pause = random.uniform(15, 40)
             logger.info("%s Пауза %.0fс", tag, pause)
             await asyncio.sleep(pause)
