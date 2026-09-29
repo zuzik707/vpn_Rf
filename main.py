@@ -487,12 +487,18 @@ async def run_monitor():
                     "logins_total": stats.logins_total,
                 })
 
-    # Two workers with relay: when worker A goes to sleep, it signals worker B to start.
-    # This way there's no dead time — one is always checking while the other sleeps.
+    # Two relay workers: each logs in with a random account, does fast re-checks
+    # every 10-15s for 10-20 min, then hands off to the other worker.
+    # Worker A checks while Worker B sleeps, then they swap.
+    # Result: slot detected within 10-15 seconds, accounts rotate naturally.
     banned_emails: set[str] = set()
-    # Events: worker signals the other to go when it starts sleeping
     relay_events = [asyncio.Event(), asyncio.Event()]
     relay_events[0].set()  # Worker 0 starts immediately
+
+    SESSION_MIN = 600   # min session length 10 min
+    SESSION_MAX = 1200  # max session length 20 min
+    RECHECK_MIN = 10    # re-check interval
+    RECHECK_MAX = 20
 
     async def relay_worker(wid: int):
         consecutive_errors = 0
@@ -500,7 +506,6 @@ async def run_monitor():
         other_event = relay_events[1 - wid]
 
         while running:
-            # Wait for signal from the other worker (or initial start)
             await my_event.wait()
             my_event.clear()
 
@@ -519,11 +524,6 @@ async def run_monitor():
                 await asyncio.sleep(600)
                 continue
 
-            if should_random_skip() and not hot_mode_shared.get("active"):
-                other_event.set()
-                await asyncio.sleep(random.uniform(20, 60))
-                continue
-
             acct = random.choice(available)
             email = acct["email"]
             proxy_url = acct.get("proxy") or Config.PROXY_URL
@@ -535,6 +535,7 @@ async def run_monitor():
             )
 
             try:
+                # Login
                 stats.logins_total += 1
                 login_ok = await checker.login()
 
@@ -543,9 +544,7 @@ async def run_monitor():
                     banned_emails.add(email)
                     logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
                     await asyncio.to_thread(notify_error,
-                        f"{tag} ЗАБАНЕН VFS!\n"
-                        f"Причина: {checker.ban_reason[:100]}\n"
-                        f"Аккаунт отключён.")
+                        f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}\nАккаунт отключён.")
                     await checker.close_browser()
                     other_event.set()
                     continue
@@ -556,69 +555,91 @@ async def run_monitor():
                     consecutive_errors += 1
                     await checker.close_browser()
                     other_event.set()
-                    await asyncio.sleep(random.uniform(30, 60))
+                    await asyncio.sleep(random.uniform(15, 30))
                     continue
 
-                await asyncio.to_thread(notify_status, f"{tag} залогинился, проверяю слоты")
+                await asyncio.to_thread(notify_status, f"{tag} залогинился, начинаю мониторинг")
                 consecutive_errors = 0
 
-                await asyncio.sleep(random.uniform(5, 15))
+                # Signal the other worker: "start getting ready while I check"
+                # The other worker will wait for its own event before actually checking
+                # This creates overlap only during login phase
 
-                found, info, screenshot = await checker.check_slots()
+                # Fast re-check loop: stay on the form, re-select subcategory every 10-20s
+                session_duration = random.uniform(SESSION_MIN, SESSION_MAX)
+                session_start = time.time()
+                check_count = 0
 
-                if checker.banned:
-                    ban_account(email, checker.ban_reason)
-                    banned_emails.add(email)
-                    logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
-                    await asyncio.to_thread(notify_error,
-                        f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}")
-                    await checker.close_browser()
-                    other_event.set()
-                    continue
+                while running and (time.time() - session_start) < session_duration:
+                    check_count += 1
+                    stats.checks_total += 1
 
-                if found:
-                    stats.checks_success += 1
-                    stats.slots_found_count += 1
-                    logger.info("%s СЛОТЫ НАЙДЕНЫ: %s", tag, info)
-                    await asyncio.to_thread(notify_slots_found, f"{tag}\n{info}", screenshot)
-                    hot_mode_shared["until"] = time.time() + Config.HOT_MODE_DURATION
-                    hot_mode_shared["active"] = True
-                else:
-                    stats.checks_success += 1
+                    try:
+                        found, info, screenshot = await checker.check_slots()
 
-                stats.checks_total += 1
+                        if checker.banned:
+                            ban_account(email, checker.ban_reason)
+                            banned_emails.add(email)
+                            logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
+                            await asyncio.to_thread(notify_error,
+                                f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}")
+                            break
+
+                        if found:
+                            stats.checks_success += 1
+                            stats.slots_found_count += 1
+                            logger.info("%s СЛОТЫ НАЙДЕНЫ: %s", tag, info)
+                            await asyncio.to_thread(notify_slots_found,
+                                f"{tag}\n{info}", screenshot)
+                            hot_mode_shared["until"] = time.time() + Config.HOT_MODE_DURATION
+                            hot_mode_shared["active"] = True
+                        else:
+                            stats.checks_success += 1
+
+                    except Exception as e:
+                        stats.checks_failed += 1
+                        consecutive_errors += 1
+                        logger.error("%s Ошибка проверки #%d: %s", tag, check_count, e)
+                        if consecutive_errors >= 3:
+                            logger.error("%s 3 ошибки подряд — выхожу из сессии", tag)
+                            break
+
+                    # Wait before next re-check
+                    recheck_wait = random.uniform(RECHECK_MIN, RECHECK_MAX)
+                    remaining = session_duration - (time.time() - session_start)
+                    if remaining <= recheck_wait:
+                        break
+                    await asyncio.sleep(recheck_wait)
+
+                elapsed = time.time() - session_start
+                logger.info("%s Сессия %.0fс, %d проверок. Передаю эстафету.",
+                            tag, elapsed, check_count)
 
             except Exception as e:
                 stats.checks_failed += 1
-                stats.checks_total += 1
                 consecutive_errors += 1
                 logger.error("%s Ошибка: %s", tag, e, exc_info=True)
             finally:
                 await checker.close_browser()
 
-            # Signal the other worker to start, then sleep
+            # Signal the other worker to start
             other_event.set()
 
+            # Sleep while the other worker is active
             hot_now = hot_mode_shared.get("active", False)
             if hot_now and time.time() > hot_mode_shared.get("until", 0):
                 hot_mode_shared["active"] = False
+                hot_now = False
 
             if hot_now:
-                sleep_time = random.uniform(Config.CHECK_INTERVAL_HOT_MIN, Config.CHECK_INTERVAL_HOT_MAX)
+                sleep_time = random.uniform(30, 60)
             elif is_daytime():
-                sleep_time = random.uniform(Config.CHECK_INTERVAL_DAY_MIN, Config.CHECK_INTERVAL_DAY_MAX)
+                sleep_time = random.uniform(60, 180)
             else:
-                sleep_time = random.uniform(Config.CHECK_INTERVAL_NIGHT_MIN, Config.CHECK_INTERVAL_NIGHT_MAX)
+                sleep_time = random.uniform(180, 360)
 
-            if consecutive_errors > 0:
-                sleep_time *= 1.5 ** min(consecutive_errors, 5)
-                sleep_time = min(sleep_time, 3600)
-
-            sleep_time *= random.uniform(0.6, 1.4)
-
-            logger.info("%s Сон %.0fс (акков: %d, режим: %s)",
-                        tag, sleep_time, len(available),
-                        "HOT" if hot_now else ("день" if is_daytime() else "ночь"))
+            sleep_time *= random.uniform(0.8, 1.2)
+            logger.info("%s Сон %.0fс до следующей сессии", tag, sleep_time)
             await asyncio.sleep(sleep_time)
 
     tasks = []
