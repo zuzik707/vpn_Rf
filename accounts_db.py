@@ -78,7 +78,7 @@ def get_enabled_accounts() -> list[dict]:
     conn = _conn()
     try:
         rows = conn.execute(
-            "SELECT email, password, proxy, fail_count, last_used "
+            "SELECT email, password, proxy, fail_count, last_used, added_at "
             "FROM accounts WHERE enabled = 1 ORDER BY last_used ASC"
         ).fetchall()
         return [dict(r) for r in rows]

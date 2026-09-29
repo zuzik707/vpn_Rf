@@ -62,11 +62,14 @@ CAPTCHA_MARKERS = [
 ]
 BLOCKED_MARKERS = [
     "access denied",
+    "access restricted",
+    "permission issues",
     "too many requests",
     "rate limit",
     "temporarily blocked",
     "account has been suspended",
     "account has been blocked",
+    "restricted for user id",
 ]
 
 

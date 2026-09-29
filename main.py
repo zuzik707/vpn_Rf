@@ -214,6 +214,13 @@ async def run_worker(worker_id: int, acct: dict, solver, budget: "BudgetGuard",
         logger.info("%s Stagger start: %.0fс", tag, stagger)
         await asyncio.sleep(stagger)
 
+    # Cooldown for freshly registered accounts — wait 3-5 min before first login
+    added_at = acct.get("added_at", 0)
+    if added_at and (time.time() - added_at) < 300:
+        cooldown = 300 - (time.time() - added_at) + random.uniform(30, 90)
+        logger.info("%s Свежий аккаунт — пауза %.0fс перед первым логином", tag, cooldown)
+        await asyncio.sleep(cooldown)
+
     try:
         stats.logins_total += 1
         login_ok = False
