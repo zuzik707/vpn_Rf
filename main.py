@@ -33,7 +33,7 @@ from accounts_db import (
 )
 from budget_guard import BudgetGuard
 from config import Config
-from notifier import notify_error, notify_slots_found, notify_status
+from notifier import notify_error, notify_slots_found, notify_status, send_telegram_photo
 from session_manager import SessionStats, save_session_state, load_session_state
 from tg_bot import TelegramBot
 from vfs_checker import VFSBrowser
@@ -575,6 +575,10 @@ async def run_monitor():
                 consecutive_errors = 0
                 login_fails[email] = 0
                 logger.info("%s Залогинился, жду очередь на проверку слотов...", tag)
+                login_screen = await checker._screenshot("login_ok")
+                await asyncio.to_thread(
+                    send_telegram_photo, login_screen,
+                    f"✅ {tag} залогинился")
 
                 # Phase 2: WAIT for turn to check slots (sequential access to VFS)
                 try:
