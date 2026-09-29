@@ -425,14 +425,13 @@ async def run_monitor():
         def status_callback():
             enabled = count_accounts()
             total = count_accounts(enabled_only=False)
-            workers_alive = sum(1 for t in worker_tasks.values() if not t.done())
             return (
                 f"<b>VFS Monitor Status</b>\n\n"
                 f"{stats.summary()}\n"
                 f"{budget.stats_text()}\n\n"
-                f"Аккаунтов: {enabled}/{total}\n"
-                f"Воркеров: {workers_alive}\n"
-                f"Режим: {'HOT' if hot_mode_shared.get('active') else ('день' if is_daytime() else 'ночь')}\n"
+                f"Аккаунтов: {enabled} активных / {total} всего\n"
+                f"Режим: sequential rotation (1 Chrome)\n"
+                f"{'HOT MODE' if hot_mode_shared.get('active') else ('День' if is_daytime() else 'Ночь')}\n"
                 f"Proxy: {Config.PROXY_URL.split('@')[-1] if Config.PROXY_URL else 'нет'}"
             )
 
@@ -444,14 +443,14 @@ async def run_monitor():
     logger.info("Старт мониторинга: %s", Config.VFS_URL)
     proxy_safe = Config.PROXY_URL.split("@")[-1] if "@" in Config.PROXY_URL else (Config.PROXY_URL[:30] or "none")
     await asyncio.to_thread(notify_status,
-        f"Мониторинг запущен v5.2 ({mode})\n"
+        f"Мониторинг запущен v6.0 (sequential rotation)\n"
         f"URL: {Config.VFS_URL}\n"
         f"Аккаунтов: {n} | {acct_list}\n"
         f"Proxy: {proxy_safe}\n"
+        f"Режим: 1 Chrome, случайный аккаунт каждый цикл\n"
         f"День: {Config.CHECK_INTERVAL_DAY_MIN}-{Config.CHECK_INTERVAL_DAY_MAX}с | "
         f"Ночь: {Config.CHECK_INTERVAL_NIGHT_MIN}-{Config.CHECK_INTERVAL_NIGHT_MAX}с\n"
-        f"TG бот: {'ON' if tg_bot else 'OFF'} | /add /list /reg /status\n"
-        f"Stack: nodriver + HumanClicker + {n}x Chrome"
+        f"TG бот: {'ON' if tg_bot else 'OFF'} | /add /list /reg /status"
     )
 
     # Heartbeat + new account watcher
@@ -459,20 +458,6 @@ async def run_monitor():
         last_hb = time.time()
         while running:
             await asyncio.sleep(30)
-
-            # Проверяем новые аккаунты каждые 30 сек
-            db_accounts = get_enabled_accounts()
-            active_emails = {email for email in worker_tasks if not worker_tasks[email].done()}
-            for acct in db_accounts:
-                if acct["email"] not in active_emails:
-                    if not acct.get("proxy"):
-                        acct["proxy"] = Config.PROXY_URL
-                    wid = len(worker_tasks)
-                    logger.info("Новый воркер для %s (W%d)", acct["email"], wid)
-                    workers_count["count"] = len(active_emails) + 1
-                    t = asyncio.create_task(
-                        run_worker(wid, acct, solver, budget, stats, hot_mode_shared, workers_count))
-                    worker_tasks[acct["email"]] = t
 
             if time.time() - last_hb >= Config.HEARTBEAT_INTERVAL_HOURS * 3600:
                 if hot_mode_shared["active"] and time.time() > hot_mode_shared["until"]:
@@ -502,16 +487,135 @@ async def run_monitor():
                     "logins_total": stats.logins_total,
                 })
 
+    # Sequential rotation: one Chrome at a time, random account each cycle
+    async def sequential_monitor():
+        consecutive_errors = 0
+        banned_emails: set[str] = set()
+        checks_per_account: dict[str, int] = {}
+
+        while running:
+            # Refresh accounts from DB each cycle
+            db_accounts = get_enabled_accounts()
+            available = [a for a in db_accounts if a["email"] not in banned_emails]
+
+            if not available:
+                logger.warning("Нет доступных аккаунтов, жду 60с...")
+                await asyncio.sleep(60)
+                continue
+
+            # Pick random account (no pattern)
+            acct = random.choice(available)
+            email = acct["email"]
+            proxy_url = acct.get("proxy") or Config.PROXY_URL
+            tag = f"[{email.split('@')[0]}]"
+            checks_per_account[email] = checks_per_account.get(email, 0) + 1
+
+            if is_quiet_hours():
+                logger.info("Тихие часы — сплю 10 мин")
+                await asyncio.sleep(600)
+                continue
+
+            if should_random_skip() and not hot_mode_shared.get("active"):
+                await asyncio.sleep(random.uniform(20, 60))
+                continue
+
+            checker = VFSBrowser(
+                captcha_solver=solver, email=email, password=acct["password"],
+                proxy_url=proxy_url, worker_id=0,
+            )
+
+            try:
+                stats.logins_total += 1
+                login_ok = await checker.login()
+
+                if checker.banned:
+                    ban_account(email, checker.ban_reason)
+                    banned_emails.add(email)
+                    logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
+                    await asyncio.to_thread(notify_error,
+                        f"{tag} ЗАБАНЕН VFS!\n"
+                        f"Причина: {checker.ban_reason[:100]}\n"
+                        f"Аккаунт отключён.")
+                    await checker.close_browser()
+                    continue
+
+                if not login_ok:
+                    stats.logins_failed += 1
+                    logger.warning("%s Логин не удался", tag)
+                    consecutive_errors += 1
+                    await checker.close_browser()
+                    await asyncio.sleep(random.uniform(30, 60))
+                    continue
+
+                await asyncio.to_thread(notify_status, f"{tag} залогинился, проверяю слоты")
+                consecutive_errors = 0
+
+                # Short pause after login
+                await asyncio.sleep(random.uniform(5, 15))
+
+                found, info, screenshot = await checker.check_slots()
+
+                if checker.banned:
+                    ban_account(email, checker.ban_reason)
+                    banned_emails.add(email)
+                    logger.error("%s ЗАБАНЕН: %s", tag, checker.ban_reason[:100])
+                    await asyncio.to_thread(notify_error,
+                        f"{tag} ЗАБАНЕН VFS!\n{checker.ban_reason[:100]}")
+                    await checker.close_browser()
+                    continue
+
+                if found:
+                    stats.checks_success += 1
+                    stats.slots_found_count += 1
+                    logger.info("%s СЛОТЫ НАЙДЕНЫ: %s", tag, info)
+                    await asyncio.to_thread(notify_slots_found, f"{tag}\n{info}", screenshot)
+                    hot_mode_shared["until"] = time.time() + Config.HOT_MODE_DURATION
+                    hot_mode_shared["active"] = True
+                else:
+                    stats.checks_success += 1
+
+                stats.checks_total += 1
+
+            except Exception as e:
+                stats.checks_failed += 1
+                stats.checks_total += 1
+                consecutive_errors += 1
+                logger.error("%s Ошибка: %s", tag, e, exc_info=True)
+            finally:
+                await checker.close_browser()
+
+            # Sleep between checks — random interval
+            hot_now = hot_mode_shared.get("active", False)
+            if hot_now and time.time() > hot_mode_shared.get("until", 0):
+                hot_mode_shared["active"] = False
+
+            n_accts = len(available)
+            if hot_now:
+                sleep_time = random.uniform(Config.CHECK_INTERVAL_HOT_MIN, Config.CHECK_INTERVAL_HOT_MAX)
+            elif is_daytime():
+                sleep_time = random.uniform(Config.CHECK_INTERVAL_DAY_MIN, Config.CHECK_INTERVAL_DAY_MAX)
+            else:
+                sleep_time = random.uniform(Config.CHECK_INTERVAL_NIGHT_MIN, Config.CHECK_INTERVAL_NIGHT_MAX)
+
+            if consecutive_errors > 0:
+                sleep_time *= 1.5 ** min(consecutive_errors, 5)
+                sleep_time = min(sleep_time, 3600)
+
+            # Jitter ±40%
+            sleep_time *= random.uniform(0.6, 1.4)
+
+            logger.info("%s Слотов нет. Сон %.0fс (акков: %d, режим: %s)",
+                        tag, sleep_time, n_accts,
+                        "HOT" if hot_now else ("день" if is_daytime() else "ночь"))
+            await asyncio.sleep(sleep_time)
+
     tasks = []
     try:
         tasks.append(asyncio.create_task(heartbeat_loop()))
-        for i, acct in enumerate(accounts):
-            t = asyncio.create_task(
-                run_worker(i, acct, solver, budget, stats, hot_mode_shared, workers_count))
-            tasks.append(t)
-            worker_tasks[acct["email"]] = t
+        seq_task = asyncio.create_task(sequential_monitor())
+        tasks.append(seq_task)
+        worker_tasks["__sequential__"] = seq_task
 
-        # Wait until signal or all workers die
         done, pending = await asyncio.wait(
             tasks, return_when=asyncio.FIRST_EXCEPTION)
         for t in done:
@@ -524,11 +628,7 @@ async def run_monitor():
             tg_bot.stop()
         for t in tasks:
             t.cancel()
-        for t in worker_tasks.values():
-            if not t.done():
-                t.cancel()
-        all_tasks = list(set(tasks) | set(worker_tasks.values()))
-        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("Стоп. %s", stats.summary())
         await asyncio.to_thread(notify_status,
             f"Мониторинг остановлен\n{stats.summary()}\n{budget.stats_text()}")
@@ -537,8 +637,8 @@ async def run_monitor():
 def main():
     print("""
  ╔═══════════════════════════════════════════════════════╗
- ║   VFS Global Slot Detector v5.0                       ║
- ║   UZB → LVA | Parallel Multi-Account + HumanClicker  ║
+ ║   VFS Global Slot Detector v6.0                       ║
+ ║   UZB → LVA | Sequential Rotation + HumanClicker     ║
  ╚═══════════════════════════════════════════════════════╝
     """)
     asyncio.run(run_monitor())
