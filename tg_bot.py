@@ -32,6 +32,9 @@ from config import Config
 from accounts_db import (
     add_account, remove_account, toggle_account,
     get_all_accounts, count_accounts, get_banned_accounts,
+    add_applicant, remove_applicant, get_applicants,
+    update_applicant_passport, reset_applicant_booked,
+    set_account_role, get_fighter_accounts, get_scout_accounts,
 )
 
 logger = logging.getLogger(__name__)
@@ -213,6 +216,12 @@ class TelegramBot:
         if chat_id != self.chat_id:
             return
 
+        # Handle photo uploads (passport scans)
+        if msg.get("photo") or msg.get("document"):
+            if chat_id in self._pending and self._pending[chat_id].get("step") == "passport_file":
+                self._handle_passport_upload(chat_id, msg)
+                return
+
         text = (msg.get("text") or "").strip()
         if not text:
             return
@@ -258,6 +267,22 @@ class TelegramBot:
             self._cmd_reactivate()
         elif cmd == "/cleanbans":
             self._cmd_cleanbans()
+        elif cmd in ("/person", "/addperson"):
+            self._cmd_add_person(chat_id, arg)
+        elif cmd in ("/persons", "/people"):
+            self._cmd_list_persons()
+        elif cmd in ("/delperson", "/rmperson"):
+            self._cmd_del_person(arg)
+        elif cmd == "/passport":
+            self._cmd_passport_start(chat_id, arg)
+        elif cmd == "/resetbook":
+            self._cmd_reset_booked(arg)
+        elif cmd == "/setscout":
+            self._cmd_set_role(arg, "scout")
+        elif cmd == "/setfighter":
+            self._cmd_set_fighter(chat_id, arg)
+        elif cmd == "/fighters":
+            self._cmd_list_fighters()
         elif cmd in ("/help", "/start"):
             self._cmd_help()
         elif cmd == "/cancel":
@@ -314,6 +339,11 @@ class TelegramBot:
                 return
             del self._pending[chat_id]
             self._run_registration(email)
+
+        elif step == "passport_file":
+            # User sent text instead of photo — ignore
+            self.send("Отправь фото или документ (JPG/PNG/PDF) паспорта, или /cancel")
+            return
 
         elif step == "confirm_deleteall":
             if text.strip().upper() == "ДА":
@@ -536,11 +566,11 @@ class TelegramBot:
             self.send("Аккаунтов нет. Добавь: /add")
             return
 
+        persons = {p["id"]: p["name"] for p in get_applicants()}
         lines = ["<b>Аккаунты VFS:</b>\n"]
         for i, a in enumerate(accounts, 1):
             status = "ON" if a["enabled"] else "OFF"
             fails = f" | {a['fail_count']} fails" if a["fail_count"] else ""
-            # Показываем session ID прокси
             proxy_tag = ""
             if a.get("proxy"):
                 match = re.search(r'-session-([^:@]+)', a["proxy"])
@@ -548,10 +578,19 @@ class TelegramBot:
                     proxy_tag = f" | IP:{match.group(1)[:8]}"
                 else:
                     proxy_tag = " | proxy"
-            lines.append(f"{i}. <code>{a['email']}</code> [{status}]{fails}{proxy_tag}")
+            role = a.get("role", "scout") or "scout"
+            if role == "fighter":
+                pid = a.get("applicant_id", 0)
+                pname = persons.get(pid, "?")
+                role_tag = f" | БОЕЦ→{pname}"
+            else:
+                role_tag = " | разведчик"
+            lines.append(f"{i}. <code>{a['email']}</code> [{status}]{role_tag}{fails}{proxy_tag}")
 
+        scouts = sum(1 for a in accounts if (a.get("role") or "scout") == "scout" and a["enabled"])
+        fighters = sum(1 for a in accounts if a.get("role") == "fighter" and a["enabled"])
         enabled = sum(1 for a in accounts if a["enabled"])
-        lines.append(f"\nАктивных: {enabled}/{len(accounts)}")
+        lines.append(f"\nАктивных: {enabled}/{len(accounts)} (разведчиков: {scouts}, бойцов: {fighters})")
         self.send("\n".join(lines))
 
     def _cmd_toggle(self, arg: str, enabled: bool):
@@ -702,6 +741,239 @@ class TelegramBot:
         t = threading.Thread(target=do_reactivate, daemon=True, name="reactivate")
         t.start()
 
+    # ── Applicants (люди для бронирования) ───────────────────────
+
+    def _cmd_add_person(self, chat_id: str, arg: str):
+        if not arg:
+            self.send("Формат: /person Имя\nПример: /person Азиз")
+            return
+        name = arg.strip()
+        aid = add_applicant(name)
+        if aid:
+            persons = get_applicants()
+            self.send(
+                f"Человек добавлен: <b>{name}</b> (#{aid})\n\n"
+                f"Теперь привяжи паспорт: /passport {aid}\n"
+                f"Всего людей: {len(persons)}"
+            )
+        else:
+            self.send("Ошибка добавления")
+
+    def _cmd_list_persons(self):
+        persons = get_applicants()
+        if not persons:
+            self.send("Людей нет. Добавь: /person Имя")
+            return
+        lines = ["<b>Люди для бронирования:</b>\n"]
+        for p in persons:
+            status = "ЗАБРОНИРОВАН" if p["booked"] else "Ждёт"
+            passport = "паспорт есть" if p["passport_file"] else "НЕТ ПАСПОРТА"
+            booked_info = ""
+            if p["booked"] and p.get("booked_date"):
+                booked_info = f" | Дата: {p['booked_date']}"
+            lines.append(
+                f"#{p['id']}. <b>{p['name']}</b> [{status}] | {passport}{booked_info}"
+            )
+        unbooked = sum(1 for p in persons if not p["booked"])
+        lines.append(f"\nОжидают: {unbooked}/{len(persons)}")
+        lines.append("\n/passport ID — привязать паспорт")
+        lines.append("/delperson ID — удалить")
+        self.send("\n".join(lines))
+
+    def _cmd_del_person(self, arg: str):
+        if not arg:
+            self.send("Формат: /delperson ID\nПример: /delperson 1")
+            return
+        try:
+            aid = int(arg.strip())
+        except ValueError:
+            self.send("ID должен быть числом")
+            return
+        if remove_applicant(aid):
+            self.send(f"Человек #{aid} удалён")
+        else:
+            self.send(f"Человек #{aid} не найден")
+
+    def _cmd_passport_start(self, chat_id: str, arg: str):
+        if not arg:
+            self.send("Формат: /passport ID\nПример: /passport 1\n\nСписок людей: /persons")
+            return
+        try:
+            aid = int(arg.strip())
+        except ValueError:
+            self.send("ID должен быть числом")
+            return
+        persons = get_applicants()
+        person = next((p for p in persons if p["id"] == aid), None)
+        if not person:
+            self.send(f"Человек #{aid} не найден. Список: /persons")
+            return
+        self._pending[chat_id] = {"step": "passport_file", "applicant_id": aid, "name": person["name"]}
+        self.send(
+            f"Привязываю паспорт для <b>{person['name']}</b> (#{aid})\n\n"
+            f"Отправь скан паспорта (фото или документ JPG/PNG/PDF):"
+        )
+
+    def _handle_passport_upload(self, chat_id: str, msg: dict):
+        state = self._pending.get(chat_id)
+        if not state:
+            return
+        aid = state["applicant_id"]
+        name = state["name"]
+        del self._pending[chat_id]
+
+        # Get file_id from photo or document
+        file_id = None
+        ext = "jpg"
+        if msg.get("photo"):
+            file_id = msg["photo"][-1]["file_id"]  # Largest photo
+        elif msg.get("document"):
+            file_id = msg["document"]["file_id"]
+            fname = msg["document"].get("file_name", "")
+            if fname:
+                ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "pdf"
+
+        if not file_id:
+            self.send("Не удалось получить файл. Попробуй ещё раз: /passport " + str(aid))
+            return
+
+        # Download file from Telegram
+        try:
+            resp = requests.get(f"{self.base_url}/getFile", params={"file_id": file_id}, timeout=10)
+            if not resp.ok:
+                self.send("Ошибка получения файла от Telegram")
+                return
+            file_path = resp.json()["result"]["file_path"]
+            file_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+            file_resp = requests.get(file_url, timeout=30)
+            if not file_resp.ok:
+                self.send("Ошибка скачивания файла")
+                return
+
+            # Save to passports directory
+            import os
+            passports_dir = os.path.join(os.path.dirname(__file__), "passports")
+            os.makedirs(passports_dir, exist_ok=True)
+            safe_name = re.sub(r'[^\w]', '_', name.lower())
+            filename = f"{safe_name}_{aid}.{ext}"
+            filepath = os.path.join(passports_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(file_resp.content)
+
+            # Update DB
+            if update_applicant_passport(aid, filepath):
+                size_kb = len(file_resp.content) / 1024
+                self.send(
+                    f"Паспорт привязан!\n\n"
+                    f"Человек: <b>{name}</b> (#{aid})\n"
+                    f"Файл: {filename} ({size_kb:.0f} KB)\n\n"
+                    f"Когда появится слот — бот автоматически забронирует"
+                )
+            else:
+                self.send("Ошибка обновления в БД")
+
+        except Exception as e:
+            logger.error("Passport upload error: %s", e)
+            self.send(f"Ошибка: {e}")
+
+    def _cmd_set_role(self, arg: str, role: str):
+        if not arg:
+            self.send(f"Формат: /setscout номер_из_list\nПример: /setscout 1")
+            return
+        accounts = get_all_accounts()
+        parts = arg.strip().split()
+        changed = 0
+        for p in parts:
+            email = None
+            if p.isdigit():
+                idx = int(p) - 1
+                if 0 <= idx < len(accounts):
+                    email = accounts[idx]["email"]
+            else:
+                email = p.lower().strip()
+            if email and set_account_role(email, role):
+                changed += 1
+        self.send(f"Назначено {role}: {changed} аккаунтов")
+
+    def _cmd_set_fighter(self, chat_id: str, arg: str):
+        if not arg:
+            self.send(
+                "Формат: /setfighter номер_аккаунта номер_человека\n"
+                "Пример: /setfighter 3 1\n"
+                "(аккаунт #3 из /list → человек #1 из /persons)\n\n"
+                "Или несколько: /setfighter 3,4,5 1\n"
+                "(аккаунты 3,4,5 → человек #1)"
+            )
+            return
+        parts = arg.strip().split()
+        if len(parts) < 2:
+            self.send("Нужно 2 аргумента: номер_аккаунта номер_человека")
+            return
+        acct_nums = parts[0].split(",")
+        try:
+            person_id = int(parts[1])
+        except ValueError:
+            self.send("ID человека должен быть числом")
+            return
+        persons = get_applicants()
+        person = next((p for p in persons if p["id"] == person_id), None)
+        if not person:
+            self.send(f"Человек #{person_id} не найден. Список: /persons")
+            return
+        accounts = get_all_accounts()
+        changed = 0
+        for num_str in acct_nums:
+            num_str = num_str.strip()
+            email = None
+            if num_str.isdigit():
+                idx = int(num_str) - 1
+                if 0 <= idx < len(accounts):
+                    email = accounts[idx]["email"]
+            else:
+                email = num_str.lower().strip()
+            if email and set_account_role(email, "fighter", person_id):
+                changed += 1
+        self.send(
+            f"Назначено {changed} аккаунтов как бойцы для <b>{person['name']}</b> (#{person_id})"
+        )
+
+    def _cmd_list_fighters(self):
+        fighters = get_fighter_accounts()
+        if not fighters:
+            self.send(
+                "Бойцов нет.\n\n"
+                "1. Добавь людей: /person Имя\n"
+                "2. Назначь аккаунты: /setfighter номер_аккаунта номер_человека"
+            )
+            return
+        persons = {p["id"]: p["name"] for p in get_applicants()}
+        lines = ["<b>Бойцы (автобукинг):</b>\n"]
+        current_person = None
+        for f in fighters:
+            pid = f.get("applicant_id", 0)
+            pname = persons.get(pid, f"#{pid}")
+            if pid != current_person:
+                current_person = pid
+                lines.append(f"\n<b>{pname}:</b>")
+            lines.append(f"  • <code>{f['email']}</code>")
+        scouts = get_scout_accounts()
+        lines.append(f"\n\nРазведчиков: {len(scouts)} | Бойцов: {len(fighters)}")
+        self.send("\n".join(lines))
+
+    def _cmd_reset_booked(self, arg: str):
+        if not arg:
+            self.send("Формат: /resetbook ID — сбросить статус бронирования")
+            return
+        try:
+            aid = int(arg.strip())
+        except ValueError:
+            self.send("ID должен быть числом")
+            return
+        if reset_applicant_booked(aid):
+            self.send(f"Статус #{aid} сброшен — будет забронирован заново при следующем слоте")
+        else:
+            self.send(f"Человек #{aid} не найден")
+
     def _cmd_cleanbans(self):
         banned = get_banned_accounts()
         if not banned:
@@ -719,22 +991,24 @@ class TelegramBot:
         self.send(
             "<b>VFS Monitor Bot</b>\n\n"
             "<b>Регистрация:</b>\n"
-            "/reg — создать 1 аккаунт (авто email + регистрация + активация)\n"
-            "/reg 5 — создать 5 аккаунтов разом\n"
-            "/reg user@mail.com — зарегать с конкретным email\n\n"
-            "<b>Управление:</b>\n"
-            "/add — добавить существующий аккаунт\n"
-            "/remove email — удалить\n"
+            "/reg — создать 1 аккаунт\n"
+            "/reg 5 — создать 5 аккаунтов\n\n"
+            "<b>Аккаунты:</b>\n"
+            "/add — добавить аккаунт\n"
             "/list — все аккаунты\n"
-            "/enable email — включить\n"
-            "/disable email — выключить\n"
-            "/bans — забаненные аккаунты\n"
-            "/delete email — удалить аккаунт\n"
-            "/cleanbans — удалить все забаненные\n"
-            "/verify — проверить все аккаунты (логин на VFS)\n"
-            "/status — статус мониторинга\n"
-            "/cancel — отменить\n\n"
-            "Каждому аккаунту свой IP через Bright Data"
+            "/delete email — удалить\n"
+            "/enable /disable email\n"
+            "/bans — забаненные\n\n"
+            "<b>Люди (автобукинг):</b>\n"
+            "/person Имя — добавить человека\n"
+            "/passport ID — привязать паспорт (отправь фото)\n"
+            "/persons — список людей\n"
+            "/delperson ID — удалить\n"
+            "/resetbook ID — сбросить бронь\n\n"
+            "<b>Статус:</b>\n"
+            "/status — мониторинг\n"
+            "/verify — проверить аккаунты\n"
+            "/cancel — отменить действие"
         )
 
     # ── Polling loop ───────────────────────────────────────────────

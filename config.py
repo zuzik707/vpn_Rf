@@ -91,6 +91,39 @@ class Config:
 
     BROWSER_DATA_DIR = os.path.join(os.path.dirname(__file__), "browser_data")
     SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), "screenshots")
+    PASSPORTS_DIR = os.path.join(os.path.dirname(__file__), "passports")
+
+    # ── Auto-booking (fighters) ──────────────────────────────────
+    # Applicants: "name1:passport_file1;name2:passport_file2"
+    # passport_file is relative to PASSPORTS_DIR
+    _applicants_raw = os.getenv("APPLICANTS", "")
+    APPLICANTS: list[dict] = []
+
+    @classmethod
+    def load_applicants(cls):
+        cls.APPLICANTS = []
+        if cls._applicants_raw:
+            for entry in cls._applicants_raw.split(";"):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                parts = entry.split(":", 1)
+                name = parts[0].strip()
+                passport_file = parts[1].strip() if len(parts) > 1 else ""
+                if name:
+                    cls.APPLICANTS.append({
+                        "name": name,
+                        "passport_file": os.path.join(cls.PASSPORTS_DIR, passport_file) if passport_file else "",
+                    })
+
+    # How many fighter accounts per applicant
+    FIGHTERS_PER_APPLICANT = int(os.getenv("FIGHTERS_PER_APPLICANT", "4"))
+    # Stagger delay between fighter waves (seconds)
+    FIGHTER_STAGGER_MIN = float(os.getenv("FIGHTER_STAGGER_MIN", "3"))
+    FIGHTER_STAGGER_MAX = float(os.getenv("FIGHTER_STAGGER_MAX", "8"))
+    # Max simultaneous fighters (depends on RAM)
+    MAX_FIGHTERS = int(os.getenv("MAX_FIGHTERS", "20"))
 
 
 Config.load_accounts()
+Config.load_applicants()
